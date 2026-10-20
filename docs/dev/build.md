@@ -24,10 +24,14 @@
 ## 4. 发布
 
 ```
-dotnet publish src/VigilWatt.App -c Release -p:Platform=x64 -o publish
+dotnet publish src/VigilWatt.App -c Release -p:Platform=x64 --self-contained true -o publish
 ```
 
-self-contained（含 Windows App SDK 运行时），约 102MB，无需安装任何依赖。产物落在仓库根 `publish/`（已 gitignore）。sln 的 GUID 是手写的，VS 能正常打开。
+self-contained（含 .NET 运行时与 Windows App SDK 运行时），约 102MB / 335 个文件，无需安装任何依赖。产物落在仓库根 `publish/`（已 gitignore）。sln 的 GUID 是手写的，VS 能正常打开。
+
+⚠ **`--self-contained true` 不能省**（2026-10-19 实测）：csproj 里虽然写了 `RuntimeIdentifier=win-x64`，但 .NET 7 起带 RID 发布不再隐含自包含。本机 SDK 10 下不带该参数只出 **153 个文件、缺 `coreclr.dll`/`hostfxr.dll`**，安装包会要求目标机自备 .NET 8，与「self-contained 无需依赖」的承诺不符。
+
+**手工替换便携版 `current` 时（2026-10-19 实踩）**：先对比目标 `current` 与 `publish/` 的文件清单。`sq.version` 由 Velopack 生成、`dotnet publish` **不产出**；漏掉它，启动器 `VigilWatt.exe` 会**静默退出（退出码 0、无任何提示）**，表现为"exe 打不开"。
 
 **发布位只有这一个**：仓库根 `publish/`。2026-10-06 目录重整时曾迁到过 `src/publish/`，但打包脚本 `scripts/build-installer.ps1` 一直用仓库根，2026-10-09 统一回仓库根——`changelog.md` 里残留的 `src/publish` 是历史流水账，不要照着它改回来。
 
