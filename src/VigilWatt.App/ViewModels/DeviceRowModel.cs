@@ -44,6 +44,7 @@ public sealed class DeviceRowModel
         bool charging = DeviceStatusFormatter.IsCharging(d.Charging);
         string state = DeviceStatusFormatter.ChargeSuffix(d.Charging);
         if (!d.IsOnline) state = " · 离线";
+        else if (ReadingFreshness.IsStale(d, DateTimeOffset.UtcNow)) state = " · 读数已过期 / Reading stale";
 
         var progressColor = d.IsOnline
             ? UiPalette.BatteryLevel(percent, charging)
@@ -65,7 +66,7 @@ public sealed class DeviceRowModel
             SourceText = DeviceSourceInfo.ShortLabel(d.Source),
             SourceBrush = UiPalette.Brush(sourceColor),
             SourceBackgroundBrush = UiPalette.Brush(UiPalette.Tint(sourceColor)),
-            SubText = $"{d.Protocol}{state}{(remainingTime.IsAvailable ? $" · 约{RemainingTimeEstimator.Format(remainingTime.Remaining!.Value)}剩余" : $" · {remainingTime.Explain()}")} · 更新于 {d.LastUpdated:HH:mm:ss}",
+            SubText = $"{d.Protocol}{state}{(remainingTime.IsAvailable ? $" · 约{RemainingTimeEstimator.Format(remainingTime.Remaining!.Value)}剩余" : $" · {remainingTime.Explain()}")} · 读数于 {d.BatteryObservedAt?.ToLocalTime().ToString("HH:mm:ss") ?? "--"}",
             IsCharging = charging,
             ProgressBrush = UiPalette.Brush(progressColor),
             PercentBrush = percentBrush,

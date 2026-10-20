@@ -611,6 +611,7 @@ public sealed class LogitechPlugin : IBatteryPlugin
         status.BatteryPercent = percent;
         status.Charging = charging;
         status.LastUpdated = DateTimeOffset.Now;
+        status.ObserveBattery(DateTimeOffset.Now);
         if (!status.IsOnline)
         {
             status.IsOnline = true;

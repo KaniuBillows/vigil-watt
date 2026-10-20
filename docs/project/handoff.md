@@ -20,6 +20,8 @@
 
 审查标准在 `docs/dev/review-standard.md`，未修项全集在 `docs/reviews/BACKLOG.md`（不要在本文再抄一份）。
 
+Fork 日常稳定性优化在本地 `codex/daily-stability-recovery`，基线为 `5a245f9`；蓝牙/HID/系统恢复、按来源隔离及读数新鲜度已实现；独立试用版见 `publish/stability-preview-20261020`，用户已授权将本轮代码合成一个提交并推送到 fork 同名分支，试用包未覆盖安装，CI/真机待验，同品牌阻塞及其他品牌身份仍有待办，路线与边界见 `dev/stability-recovery.md`。已有 PR 不变。
+
 社区分支 `integrate/community-contributions` 已收 6 个提交（HECATE → AULA/DELUX → DualSense → 迈从鼠标 V2 → GANSS → V9 Pro 耳机），2026-10-19 以 `--no-ff` 合并进 `main`（合并提交 `90cf94b`），该分支按用户要求**留在本地，未推送也未删除**。设备接入到此为止；设备管理类改动（#14 双通道去重、#16 设备管理）、#15 的 BLE 大改、issue #12/#11 都按 BACKLOG CR-68 ~ CR-72 排队，本轮不做。
 
 2026-10-19 设备扩展：CHERRY MX 8.2、迈从 A5 与 Haute + DualSense 均已真机读取；A5 归迈从品牌，托盘图标可独立关闭，Haute 使用芯片 ID 并支持读取恢复。CHERRY / Mchose / Razer 默认关闭，Haute 仅读取默认开启。协议与历史兼容边界见 `hardware/protocols.md` §13–§16，长期观察见 CR-74，审查见 `reviews/archive/reconnect-2026-10-19.md`。

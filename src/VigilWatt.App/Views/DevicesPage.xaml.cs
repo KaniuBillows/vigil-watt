@@ -341,7 +341,7 @@ public sealed partial class DevicesPage : Page
         var startedAt = DateTimeOffset.Now;
         try
         {
-            // 等整轮跑完（含 BLE 异步补读）。若自动轮询正在进行，这里会复用那一轮，不会白跑也不会被丢弃。
+            // 有限等待当前轮次；慢来源继续由原所有者持有，不因按钮重试而并发启动。
             await App.Services.Manager.RequestPollAsync();
         }
         catch (Exception ex)

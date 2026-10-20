@@ -42,7 +42,10 @@ public sealed class SystemBatteryWatcher : IDisposable
         }
 
         var snapshot = SystemPowerReader.Read();
-        Apply(snapshot);
+        lock (_sync)
+        {
+            if (_started) Apply(snapshot);
+        }
     }
 
     /// <summary>停止监控并撤下设备条目（用户关掉开关时调用）：DeviceManager 按 <see cref="DeviceId"/> 撤除条目，这里只把自己标记为"不再推送"，否则 Refresh 会把条目加回来。</summary>
@@ -64,10 +67,12 @@ public sealed class SystemBatteryWatcher : IDisposable
             if (_status != null)
             {
                 _status.IsOnline = false;
+                _status.ReadingConnectionConfirmed = false;
                 _status.LastUpdated = DateTimeOffset.Now;
+                _status.ConnectionObservedAt = _status.LastUpdated;
                 var offline = _status;
                 _status = null;
-                DeviceUpdated?.Invoke(offline);
+                DeviceUpdated?.Invoke(offline.Clone());
             }
             return;
         }
@@ -91,16 +96,21 @@ public sealed class SystemBatteryWatcher : IDisposable
 
         // 无电池分支刚判断过，所以这里 Percent 为 null 只可能是"有电池但读数未知"，
         // 该情况保留上一次的百分比，不要用 null 覆盖掉已有读数。
-        if (snapshot.Percent.HasValue) status.BatteryPercent = snapshot.Percent;
+        if (snapshot.Percent.HasValue)
+        {
+            status.BatteryPercent = snapshot.Percent;
+            status.ObserveBattery(DateTimeOffset.Now);
+        }
         status.Charging = charging;
         status.IsOnline = true;
+        status.ConnectionObservedAt = DateTimeOffset.Now;
         status.LastUpdated = DateTimeOffset.Now;
 
-        if (changed)
+        if (changed || snapshot.Percent.HasValue)
         {
             if (isNew)
                 Log.Info($"系统电量已接入: {status.DisplayName} {status.BatteryPercent?.ToString() ?? "--"}% {status.Charging}");
-            DeviceUpdated?.Invoke(status);
+            DeviceUpdated?.Invoke(status.Clone());
         }
     }
 
@@ -119,7 +129,7 @@ public sealed class SystemBatteryWatcher : IDisposable
     {
         get
         {
-            lock (_sync) return _status;
+            lock (_sync) return _status?.Clone();
         }
     }
 

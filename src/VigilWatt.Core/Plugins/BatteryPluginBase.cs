@@ -10,7 +10,7 @@ namespace VigilWatt.Core.Plugins;
 /// 2026/10/06 15:53:36 xliu
 /// 链路全貌见 docs/project/code-flow.md §4。
 /// </summary>
-public abstract class BatteryPluginBase : IBatteryPlugin
+public abstract partial class BatteryPluginBase : IBatteryPlugin
 {
     public abstract string Name { get; }
     public abstract string DisplayName { get; }
@@ -44,7 +44,7 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     public event Action<DeviceStatus>? StatusPushed;
 
     /// <summary>供子类/基类被动监听推送轮询外的状态更新。</summary>
-    protected void RaiseStatusPushed(DeviceStatus status) => StatusPushed?.Invoke(status);
+    protected void RaiseStatusPushed(DeviceStatus status) => StatusPushed?.Invoke(status.Clone());
 
     /// <summary>认领时没有读数是否标离线。默认 true，避免只剩 dongle 时假装在线。</summary>
     protected virtual bool NullPercentMeansOffline => true;
@@ -100,6 +100,7 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     /// 零写入探测（雷柏、英菲克纯被动）置 false。这是**机制事实**声明，与用户开关无关。
     /// </summary>
     protected virtual bool ProbeWrites => true;
+    protected virtual bool SupportsReadOnlyHealthCheck => false;
 
     protected sealed class TrackedDevice
     {
@@ -126,6 +127,9 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         public bool FreshlyClaimed;
         /// <summary>插件要求下一轮重新探测本接口（句柄身份不符等）：Attach 会先释放旧句柄再重探。</summary>
         public bool NeedsReprobe;
+        public volatile bool Retired;
+        public readonly object StateGate = new();
+        public DateTimeOffset LastReadingPushAt;
         /// <summary>与后台被动监听互斥，保护单悬空 ReadInput / 写读会话。</summary>
         public readonly object IoGate = new();
         /// <summary>最近一次被动监听收到**任何**报文的时间（用于沉默离线；不是"解析成功"的时间）。</summary>
@@ -174,12 +178,24 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     private readonly Dictionary<string, DateTimeOffset> _probeFailedAt = new(StringComparer.OrdinalIgnoreCase);
     private DeviceClaimRegistry _claims = null!;
 
-    public async Task<IReadOnlyList<DeviceStatus>> AttachAsync(
+    public Task<IReadOnlyList<DeviceStatus>> AttachAsync(
         IReadOnlyList<HidDeviceInfo> availableDevices, DeviceClaimRegistry claims)
+        => AttachCoreAsync(availableDevices, claims, recoveryPass: false);
+
+    public Task<IReadOnlyList<DeviceStatus>> RecoverAsync(
+        IReadOnlyList<HidDeviceInfo> availableDevices, DeviceClaimRegistry claims)
+        => AttachCoreAsync(availableDevices, claims, recoveryPass: true);
+
+    private async Task<IReadOnlyList<DeviceStatus>> AttachCoreAsync(
+        IReadOnlyList<HidDeviceInfo> availableDevices, DeviceClaimRegistry claims, bool recoveryPass)
     {
+        if (_shutdownRequested) return Array.Empty<DeviceStatus>();
         _claims = claims;
+        SweepRetired();
         var claimed = new List<DeviceStatus>();
         var availablePaths = availableDevices.Select(d => d.DevicePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in _recoveryCarry.Keys.Where(path => !availablePaths.Contains(path)).ToArray()) _recoveryCarry.Remove(path);
+        _recoveryBudget?.Prune(availablePaths);
 
         // 先释放消失的接口，否则旧身份会把同轮重连的新接口当成重复设备。
         foreach (var path in _devices.Keys.ToList())
@@ -187,13 +203,8 @@ public abstract class BatteryPluginBase : IBatteryPlugin
             if (availablePaths.Contains(path)) continue;
             if (_devices.Remove(path, out var gone))
             {
-                StopPassiveListen(gone);
-                gone.Handle.Dispose();
-                gone.Status.IsOnline = false;
-                gone.Status.LastUpdated = DateTimeOffset.Now;
-                _claims.Release(path, Name);
                 Log.Info($"{DisplayName} 设备已移除: {path}");
-                claimed.Add(gone.Status);
+                claimed.Add(Retire(path, gone, preserveRecovery: false));
             }
         }
 
@@ -204,27 +215,29 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         {
             if (!seenPaths.Add(info.DevicePath) || !IsCandidate(info)) continue;
 
-            if (_devices.TryGetValue(info.DevicePath, out var known) && !known.NeedsReprobe)
+            if (_devices.TryGetValue(info.DevicePath, out var known) && !known.NeedsReprobe && !known.Handle.NeedsRecovery)
             {
                 known.Info = info;   // 重扫后元数据可能更新
-                claimed.Add(known.Status);
+                claimed.Add(Snapshot(known));
                 continue;
             }
 
             // 插件要求重探：先放掉旧句柄与认领，同一路径稍后会重新探测并覆盖条目。
             if (_devices.Remove(info.DevicePath, out var stale))
             {
-                StopPassiveListen(stale);
-                stale.Handle.Dispose();
-                stale.Status.IsOnline = false;
-                stale.Status.LastUpdated = DateTimeOffset.Now;
-                claimed.Add(stale.Status);
-                _claims?.Release(info.DevicePath, Name);
+                claimed.Add(Retire(info.DevicePath, stale, preserveRecovery: true));
             }
 
+            SweepRetired();
+
+            if (recoveryPass && ProbeWrites && !SupportsDiscoveryProbe &&
+                !_recoveryCarry.ContainsKey(info.DevicePath)) continue;
+
             if (_probeFailedAt.TryGetValue(info.DevicePath, out var failedAt) &&
-                DateTimeOffset.Now - failedAt < ResolveProbeCooldown(info))
+                Clock.GetUtcNow() - failedAt < ResolveProbeCooldown(info))
                 continue;
+
+            if (!CanRecover(info.DevicePath, info)) continue;
 
             if (!claims.TryClaim(info.DevicePath, Name)) continue;   // 已被其他插件认领
 
@@ -234,16 +247,18 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         // 第二遍（慢）：本插件内逐个探测；与其它插件的 AttachAsync 由 DeviceManager 并行。
         if (toProbe.Count > 0)
         {
-            var outcomes = new ProbeOutcome[toProbe.Count];
-            for (int i = 0; i < toProbe.Count; i++)
-                outcomes[i] = await RunProbeAsync(toProbe[i]).ConfigureAwait(false);
-            CommitProbes(outcomes, claimed);
+            foreach (var info in toProbe)
+            {
+                if (_shutdownRequested || _retired.Count > 0) { claims.Release(info.DevicePath, Name); continue; }
+                CommitProbes([await RunProbeAsync(info).ConfigureAwait(false)], claimed);
+                SweepRetired();
+            }
         }
 
         return claimed;
     }
 
-    /// <summary>打开句柄并跑协议探测。成功返回持有句柄 + 探测值；失败/异常返回空句柄并已释放。</summary>
+    /// <summary>失败句柄仍交回收尾，避免底层操作尚未结束就释放认领。</summary>
     private async Task<ProbeOutcome> RunProbeAsync(HidDeviceInfo info)
     {
         // 探测会写帧、而写入许可被关：跳过探测，一帧都不发（安全规则 R1，见 docs/hardware/safety.md §3）。
@@ -253,25 +268,28 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         HidDeviceHandle? handle = null;
         try
         {
+            if (_shutdownRequested) return new ProbeOutcome(info, null, null);
             handle = OpenDevice(info);
+            _liveHandles.TryAdd(handle, 0);
+            if (_shutdownRequested) { handle.Dispose(); return new ProbeOutcome(info, handle, null); }
             var probe = await ProbeAsync(handle).ConfigureAwait(false);
             if (probe == null)
             {
                 handle.Dispose();
-                return new ProbeOutcome(info, null, null);
+                return new ProbeOutcome(info, handle, null);
             }
             return new ProbeOutcome(info, handle, probe, BuildDeviceId(handle));
         }
         catch (UnauthorizedAccessException)
         {
             handle?.Dispose();
-            return new ProbeOutcome(info, null, null);
+            return new ProbeOutcome(info, handle, null);
         }
         catch (Exception ex)
         {
             Log.Error($"{DisplayName} 探测异常: {info.DevicePath}", ex);
             handle?.Dispose();
-            return new ProbeOutcome(info, null, null);
+            return new ProbeOutcome(info, handle, null);
         }
     }
 
@@ -284,10 +302,11 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     {
         foreach (var o in outcomes)
         {
-            if (o.Result is not { } probe)
+            if (o.Result is not { } probe || o.Handle!.NeedsRecovery)
             {
-                _claims.Release(o.Info.DevicePath, Name);
-                _probeFailedAt[o.Info.DevicePath] = DateTimeOffset.Now;
+                if (o.Handle != null) RetireHandle(o.Info.DevicePath, o.Handle);
+                else _claims.Release(o.Info.DevicePath, Name);
+                _probeFailedAt[o.Info.DevicePath] = Clock.GetUtcNow();
                 continue;
             }
 
@@ -295,8 +314,7 @@ public abstract class BatteryPluginBase : IBatteryPlugin
             // 同一物理设备的第二个接口（别名/同一 unit）已在别处认领：释放新句柄，不建重复条目。
             if (_devices.Values.Any(existing => existing.Status.Id == o.DeviceId))
             {
-                o.Handle!.Dispose();
-                _claims.Release(o.Info.DevicePath, Name);
+                RetireHandle(o.Info.DevicePath, o.Handle!);
                 continue;
             }
             var status = new DeviceStatus
@@ -308,6 +326,9 @@ public abstract class BatteryPluginBase : IBatteryPlugin
                 Protocol = protocol,
                 BatteryPercent = percent,
                 Charging = charging,
+                BatteryObservedAt = percent.HasValue ? Clock.GetUtcNow() : null,
+                ConnectionObservedAt = Clock.GetUtcNow(),
+                ReadingConnectionConfirmed = percent.HasValue,
                 // 无读数默认离线。子类把 NullPercentMeansOffline 覆写为 false 时保持在线。
                 IsOnline = percent.HasValue || !NullPercentMeansOffline,
             };
@@ -318,13 +339,31 @@ public abstract class BatteryPluginBase : IBatteryPlugin
                 // 无读数但仍在线也要记下时刻，否则静音兜底永不触发。
                 LastPassiveAt = status.IsOnline ? DateTimeOffset.Now : default,
             };
+            if (_recoveryCarry.Remove(o.Info.DevicePath, out var previous) && previous.Status.Id == status.Id)
+            {
+                dev.WritesDisabled = previous.WritesDisabled;
+                dev.WritesDisabledAt = previous.WritesDisabledAt;
+                dev.BreakerTrips = previous.BreakerTrips;
+                dev.ConsecutiveFailures = previous.ConsecutiveFailures;
+                dev.LastBypassAt = previous.LastBypassAt;
+                dev.Filter = previous.Filter;
+                dev.Status = previous.Status.Clone();
+                dev.Status.IsOnline = false;
+                dev.Status.ReadingConnectionConfirmed = false;
+                dev.Status.LastUpdated = Clock.GetUtcNow();
+                dev.Status.ConnectionObservedAt = dev.Status.LastUpdated;
+                if (percent.HasValue || !NullPercentMeansOffline)
+                    TryApplyReading(dev, percent, charging, push: false);
+                status = dev.Status;
+            }
+            _recoveryBudget?.MarkHealthy(o.Info.DevicePath);
             _devices[o.Info.DevicePath] = dev;
             if (SupportsPassiveListen)
                 StartPassiveListen(dev);
             Log.Info($"认领{DisplayName}设备: {o.Info} proto={protocol} 电量={percent} 充电={charging}");
             // 同一身份已接回时不能再向列表发送旧接口的离线状态。
             claimed.RemoveAll(existing => existing.Id == status.Id);
-            claimed.Add(status);
+            claimed.Add(Snapshot(dev));
         }
     }
 
@@ -333,18 +372,28 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         if (dev.ListenTask != null) return;
         dev.ListenCts = new CancellationTokenSource();
         var cts = dev.ListenCts;
-        dev.ListenTask = Task.Run(() =>
+        dev.ListenTask = Task.Run(async () =>
         {
             Log.Info($"{DisplayName} 被动监听已启动: {dev.Status.DisplayName}");
-            while (!cts.IsCancellationRequested)
+            while (!cts.IsCancellationRequested && !dev.Retired)
             {
                 try
                 {
                     byte[]? input;
                     lock (dev.IoGate)
+                    {
+                        if (dev.Retired) return;
                         input = dev.Handle.ReadInput(TimeSpan.FromMilliseconds(500));
+                    }
+                    if (dev.Handle.NeedsRecovery)
+                    {
+                        FlagHandleRecovery(dev);
+                        break;
+                    }
                     if (input == null)
                     {
+                        if (dev.Handle.LastResult.Status is not (HidIoStatus.Timeout or HidIoStatus.NoData))
+                            await Task.Delay(500, cts.Token).ConfigureAwait(false);
                         // 静音期不是无事可做：延迟离线确认、半开重试与"立刻核实"靠的都是这里的节拍（约 500ms 一次）。
                         CheckOfflineCandidate(dev);
                         CheckPassiveSilence(dev);
@@ -382,25 +431,23 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         }, cts.Token);
     }
 
-    private void StopPassiveListen(TrackedDevice dev)
+    /// <summary>统一离线出口并保持幂等，避免重复通知或退役任务回写。</summary>
+    private bool MarkOffline(TrackedDevice dev, string reason)
     {
-        try { dev.ListenCts?.Cancel(); } catch { /* ignore */ }
-        try { dev.ListenTask?.Wait(TimeSpan.FromSeconds(1)); } catch { /* ignore */ }
-        dev.ListenCts?.Dispose();
-        dev.ListenCts = null;
-        dev.ListenTask = null;
+        lock (dev.StateGate) return !_shutdownRequested && !dev.Retired && MarkOfflineCore(dev, reason);
     }
 
-    /// <summary>
-    /// 把设备标为离线——**所有离线路径的唯一落地点**：翻 IsOnline、盖时间戳、记日志、立即推送。
-    /// <b>幂等</b>：已经离线就什么都不做并返回 false。返回值只表示"本次真的翻转了"。
-    /// </summary>
-    private bool MarkOffline(TrackedDevice dev, string reason)
+    private bool MarkOfflineCore(TrackedDevice dev, string reason)
     {
         if (!dev.Status.IsOnline) return false;
 
         dev.Status.IsOnline = false;
+
+        dev.Status.ReadingConnectionConfirmed = false;
+
         dev.Status.LastUpdated = DateTimeOffset.Now;
+
+        dev.Status.ConnectionObservedAt = dev.Status.LastUpdated;
         Log.Info($"{DisplayName} {dev.Status.DisplayName} {reason}");
         RaiseStatusPushed(dev.Status);
         return true;
@@ -425,12 +472,7 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         MarkOffline(dev, $"被动沉默超过 {Offline.Silence.TotalSeconds:0}s，标记离线");
     }
 
-    /// <summary>
-    /// 消费插件在被动帧里提交的"立刻核实"请求（见 <see cref="RequestConfirm"/>）：空闲 tick 上跑一次
-    /// 与轮询同款的查询，插件照常自己报账。必须在这条路径上做——只有它是秒级节拍。
-    /// **熔断期内也照跑**：它是设备自发信号触发的、不是轮询重试，挡住它等于把唤醒信号丢掉（CR-53）；
-    /// 放行频率由 <see cref="BypassMinInterval"/> 兜住。
-    /// </summary>
+    /// <summary>设备自发信号的核实不能被熔断吞掉，写入授权与最小间隔仍适用。</summary>
     private void RunPendingConfirm(TrackedDevice dev)
     {
         if (!dev.ConfirmRequested) return;
@@ -447,10 +489,13 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         // BypassActive 是跨线程共享的可变字段（60 秒轮询线程也会经 CanWrite 读它），故与 PollDevice 同锁读写（R3）。
         lock (dev.IoGate)
         {
+            if (dev.Retired || dev.Handle.NeedsRecovery) return;
             dev.BypassActive = bypass;
             try { read = PollDevice(dev); }
             finally { dev.BypassActive = false; }
         }
+
+        if (dev.Handle.NeedsRecovery) { FlagHandleRecovery(dev); return; }
 
         if (read.HasValue)
         {
@@ -496,6 +541,9 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         {
             try
             {
+                if (_shutdownRequested || dev.Retired) continue;
+                if (dev.Handle.NeedsRecovery) { FlagHandleRecovery(dev); continue; }
+                if (dev.NeedsReprobe) continue;
                 // 本轮刚由探测建立：探测返回值就是最新读数，不再立刻重读一遍（首扫提速），只跳过一轮。
                 if (dev.FreshlyClaimed)
                 {
@@ -505,15 +553,21 @@ public abstract class BatteryPluginBase : IBatteryPlugin
 
                 (int? Percent, ChargingState Charging)? read;
                 lock (dev.IoGate)
+                {
+                    if (dev.Retired) continue;
                     read = PollDevice(dev);
+                }
+                if (dev.Handle.NeedsRecovery) { FlagHandleRecovery(dev); continue; }
 
                 // 设备主动告知休眠/关机（协议层明确帧）：立即标离线，不等 3 次查询失败（那要 3 分钟）。
                 if (ConsumeOfflineRequest(dev)) continue;
 
                 if (read.HasValue)
                 {
-                    if (TryApplyReading(dev, read.Value.Percent, read.Value.Charging, push: false))
-                        updated.Add(dev.Status);
+                    var previousReading = Snapshot(dev).BatteryObservedAt;
+                    bool changed = TryApplyReading(dev, read.Value.Percent, read.Value.Charging, push: false);
+                    var snapshot = Snapshot(dev);
+                    if (changed || snapshot.BatteryObservedAt != previousReading) updated.Add(snapshot);
                 }
                 else
                 {
@@ -523,7 +577,7 @@ public abstract class BatteryPluginBase : IBatteryPlugin
                         DateTimeOffset.Now - dev.LastPassiveAt > Offline.Silence)
                     {
                         if (MarkOffline(dev, $"被动沉默超过 {Offline.Silence.TotalSeconds:0}s，标记离线"))
-                            updated.Add(dev.Status);
+                            updated.Add(Snapshot(dev));
                     }
 
                     // 判据二：查询失败熔断。只给"轮询确实会发帧、且 null 就是失联"的插件开。
@@ -536,7 +590,7 @@ public abstract class BatteryPluginBase : IBatteryPlugin
                             TripBreaker(dev);
                         if (dev.ConsecutiveFailures >= Offline.MaxFailures &&
                             MarkOffline(dev, "连续查询失败，标记离线"))
-                            updated.Add(dev.Status);
+                            updated.Add(Snapshot(dev));
                     }
                 }
             }
@@ -548,11 +602,14 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         return updated;
     }
 
-    /// <summary>
-    /// 统一应用读数（过滤 + 更新字段）。<paramref name="push"/> = true 时若有变化则 RaiseStatusPushed。
-    /// 返回是否产生了应对外可见的状态变化。
-    /// </summary>
+    /// <summary>过滤与发布同锁完成，避免旧任务在退役后覆盖新连接。</summary>
     private bool TryApplyReading(TrackedDevice dev, int? percent, ChargingState charging, bool push)
+    {
+        lock (dev.StateGate)
+            return !_shutdownRequested && !dev.Retired && TryApplyReadingCore(dev, percent, charging, push);
+    }
+
+    private bool TryApplyReadingCore(TrackedDevice dev, int? percent, ChargingState charging, bool push)
     {
         if (percent.HasValue)
         {
@@ -581,7 +638,8 @@ public abstract class BatteryPluginBase : IBatteryPlugin
 
         dev.Status.BatteryPercent = percent;
         dev.Status.Charging = charging;
-        dev.Status.LastUpdated = DateTimeOffset.Now;
+        dev.Status.LastUpdated = Clock.GetUtcNow();
+        if (percent.HasValue) dev.Status.ObserveBattery(Clock.GetUtcNow());
         if (!dev.Status.IsOnline)
         {
             dev.Status.IsOnline = true;
@@ -590,8 +648,11 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         }
         dev.ConsecutiveFailures = 0;
 
-        if (changed && push)
+        if (push && (changed || percent.HasValue && Clock.GetUtcNow() - dev.LastReadingPushAt >= TimeSpan.FromSeconds(30)))
+        {
+            dev.LastReadingPushAt = Clock.GetUtcNow();
             RaiseStatusPushed(dev.Status);
+        }
         return changed;
     }
 
@@ -600,13 +661,12 @@ public abstract class BatteryPluginBase : IBatteryPlugin
         // 插件被禁用时 DeviceManager 每轮都会调一次 Detach（CR-22）：手上没设备就别打日志，
         // 否则禁用期间每 60 秒刷一条"插件已卸载"的假日志。
         int released = _devices.Count;
-        foreach (var dev in _devices.Values)
+        foreach (var (path, dev) in _devices)
         {
-            StopPassiveListen(dev);
-            dev.Handle.Dispose();
+            Retire(path, dev, preserveRecovery: false);
         }
         _devices.Clear();
-        _claims?.ReleaseAll(Name);
+        SweepRetired();
         if (released > 0)
             Log.Info($"{DisplayName} 插件已卸载，释放 {released} 台设备");
     }
@@ -614,6 +674,7 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     /// <summary>该设备当前是否允许写入（总开关 + 熔断退避 + 事件驱动放行）。子类发帧前检查；退避期满自动恢复一轮。</summary>
     protected bool CanWrite(TrackedDevice dev)
     {
+        if (_shutdownRequested || dev.Retired || dev.Handle.NeedsRecovery) return false;
         if (!WritesEnabled) return false;
         // 设备自己发信号触发的核实不受熔断限制、也不改熔断状态——挡住它等于把唤醒信号丢掉（CR-53）。
         if (dev.BypassActive) return true;
@@ -665,29 +726,20 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     protected static void ClearOfflineCandidate(TrackedDevice dev)
         => dev.OfflineCandidateSince = default;
 
-    /// <summary>
-    /// 主动查询型插件在 <see cref="PollDevice"/> 里"**发过帧**但设备没应答"时调用：计入连续失败，
-    /// 满 <see cref="OfflinePolicy.MaxFailures"/> 次则熔断停写 + 标离线。
-    ///
-    /// 需要这个入口是因为基类的自动记账（<see cref="OfflinePolicy.CountPollFailures"/>）不适用于所有协议：
-    /// 雷柏根本没有查询命令、迈从的 null 又与"没开写入 / 熔断中"不可区分。这些插件置 false 后改由本
-    /// 入口自己报账，否则失败计数永远是 0，既不标离线也不熔断。**只有插件知道这一轮到底发帧了没有**，
-    /// 未开写入 / 熔断中 / 纯推送的分支提前 return 即可。
-    /// </summary>
+    /// <summary>只有实际发过帧才记失败，退役结果不得污染新连接；见 docs/dev/stability-recovery.md §7。</summary>
     protected void ReportPollFailure(TrackedDevice dev)
     {
+        if (dev.Retired || dev.Handle.NeedsRecovery) return;
         if (++dev.ConsecutiveFailures < Offline.MaxFailures) return;
         // 每次都重新起算退避并升档（含"熔断期内半开重试又失败"）：否则退避会永远停在首次的 30 秒，等于没有递增。
         TripBreaker(dev);
         RequestOffline(dev);
     }
 
-    /// <summary>
-    /// 熔断落地：停写 + 升档 + 记一条 WARN。基类 <see cref="Poll"/> 的自动记账分不清"没应答"与
-    /// "被熔断挡住没发帧"，故那条路径只在首次跨过阈值时调它，否则退避会被每轮重置、永远不到期。
-    /// </summary>
+    /// <summary>自动记账只在首次跨阈值时熔断，否则每轮会推迟退避到期。</summary>
     private void TripBreaker(TrackedDevice dev)
     {
+        if (dev.Retired) return;
         dev.WritesDisabled = true;
         dev.WritesDisabledAt = DateTimeOffset.Now;
         dev.BreakerTrips++;
@@ -698,6 +750,7 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     /// <summary>主动查询拿到应答 → 清零失败计数与退避档位；熔断中则提前解除（设备已回来，没有理由继续停写）。</summary>
     protected void ReportPollAnswered(TrackedDevice dev)
     {
+        if (dev.Retired || dev.Handle.NeedsRecovery) return;
         dev.ConsecutiveFailures = 0;
         dev.BreakerTrips = 0;
         if (!dev.WritesDisabled) return;

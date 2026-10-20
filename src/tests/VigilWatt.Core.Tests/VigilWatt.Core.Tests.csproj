@@ -34,6 +34,8 @@
   <ItemGroup>
     <Compile Include="..\..\VigilWatt.Core\Plugins\BatteryReadingFilter.cs" />
     <Compile Include="..\..\VigilWatt.Core\Plugins\BatteryPluginBase.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Plugins\BatteryPluginBase.Recovery.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Plugins\RecoveryAttemptBudget.cs" />
     <Compile Include="..\..\VigilWatt.Core\Plugins\IBatteryPlugin.cs" />
     <Compile Include="..\..\VigilWatt.Core\Plugins\PluginUtils.cs" />
     <Compile Include="..\..\VigilWatt.Core\Plugins\DeviceClaimRegistry.cs" />
@@ -46,6 +48,9 @@
     <Compile Include="..\..\VigilWatt.Core\Plugins\Mchose\MchoseA5Codec.cs" />
     <Compile Include="..\..\VigilWatt.Core\Plugins\Mchose\MchoseMouseProtocol.cs" />
     <Compile Include="..\..\VigilWatt.Core\Hid\HidDeviceInfo.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Hid\HidDeviceHandle.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Hid\HidFileIo.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Hid\HidIoResult.cs" />
     <Compile Include="..\..\VigilWatt.Core\Hid\NativeHid.cs" />
     <Compile Include="..\..\VigilWatt.Core\Plugins\Cherry\CherryCodec.cs" />
     <Compile Include="..\..\VigilWatt.Core\Plugins\Razer\RazerCodec.cs" />
@@ -60,6 +65,9 @@
     <Compile Include="..\..\VigilWatt.Core\Plugins\Logitech\HidppCodec.cs" />
     <Compile Include="..\..\VigilWatt.Core\Ble\ClassicDeviceName.cs" />
     <Compile Include="..\..\VigilWatt.Core\Ble\WatcherProps.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Ble\WatcherRecovery.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Ble\ConnectionEpochs.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Ble\ConnectionVerificationQueue.cs" />
     <Compile Include="..\..\VigilWatt.Core\Models\DeviceKind.cs" />
     <Compile Include="..\..\VigilWatt.Core\Models\DeviceKindGuesser.cs" />
     <Compile Include="..\..\VigilWatt.Core\Models\ClassicDeviceKindResolver.cs" />
@@ -71,6 +79,10 @@
     <Compile Include="..\..\VigilWatt.Core\Models\ChargingStateMap.cs" />
     <Compile Include="..\..\VigilWatt.Core\Devices\DeviceStatusMerger.cs" />
     <Compile Include="..\..\VigilWatt.Core\Devices\DeviceChangeDetector.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Devices\RecoveryScheduler.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Devices\MonitorWorkSlot.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Devices\ReadingFreshness.cs" />
+    <Compile Include="..\..\VigilWatt.Core\Devices\ReadingSampleRecorder.cs" />
     <Compile Include="..\..\VigilWatt.Core\Devices\RemainingTimeEstimator.cs" />
     <Compile Include="..\..\VigilWatt.Core\Power\SystemPowerReader.cs" />
     <Compile Include="..\..\VigilWatt.Core\Power\SystemBatteryWatcher.cs" />
@@ -84,6 +96,7 @@
     <Compile Include="..\..\VigilWatt.App\Services\AppVisibilityPolicy.cs" />
     <!-- 任务栏贴片的定位数学与取值收敛同样是零依赖纯逻辑（只碰 int/Math），定位算错必须能在单测里复现 -->
     <Compile Include="..\..\VigilWatt.App\Services\TaskbarLayout.cs" />
+    <Compile Include="..\..\VigilWatt.App\Services\RecoverySignal.cs" />
     <Compile Include="..\..\VigilWatt.App\Services\TaskbarBatteryMode.cs" />
     <Compile Include="..\..\VigilWatt.App\Services\TaskbarBatteryPosition.cs" />
     <!-- 更新日志解析是三处消费方共用的格式契约（打包截段、Release 正文、应用内渲染），

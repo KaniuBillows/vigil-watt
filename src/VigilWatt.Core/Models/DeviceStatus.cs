@@ -44,6 +44,19 @@ public class DeviceStatus
 
     public DateTimeOffset LastUpdated { get; set; } = DateTimeOffset.Now;
 
+    public DateTimeOffset? BatteryObservedAt { get; set; }
+    public DateTimeOffset? ConnectionObservedAt { get; set; }
+    public DateTimeOffset? StateChangedAt { get; set; }
+    public bool ReadingConnectionConfirmed { get; set; }
+
+    public void ObserveBattery(DateTimeOffset now)
+    {
+        if (!BatteryPercent.HasValue) return;
+        BatteryObservedAt = now;
+        ConnectionObservedAt = now;
+        ReadingConnectionConfirmed = true;
+    }
+
     public bool IsOnline { get; set; } = true;
 
     /// <summary>参与统计曲线时用于图例显示的短名。</summary>
@@ -60,6 +73,10 @@ public class DeviceStatus
         Charging = Charging,
         Protocol = Protocol,
         LastUpdated = LastUpdated,
+        BatteryObservedAt = BatteryObservedAt,
+        ConnectionObservedAt = ConnectionObservedAt,
+        StateChangedAt = StateChangedAt,
+        ReadingConnectionConfirmed = ReadingConnectionConfirmed,
         IsOnline = IsOnline,
     };
 

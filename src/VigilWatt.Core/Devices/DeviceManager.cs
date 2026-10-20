@@ -16,7 +16,7 @@ namespace VigilWatt.Core.Devices;
 /// 2026/10/06 15:53:36 xliu
 /// 详见 docs/project/architecture.md §1。
 /// </summary>
-public sealed class DeviceManager : IDisposable
+public sealed partial class DeviceManager : IDisposable
 {
     private readonly AppSettings _settings;
     private readonly HistoryStore _history;
@@ -32,16 +32,27 @@ public sealed class DeviceManager : IDisposable
     /// 设备条目被移除时也一并清掉（见 <see cref="ExpireTombstones"/> / <see cref="DropDevicesOf"/>，CR-23）。</summary>
     private readonly ConcurrentDictionary<string, bool> _lowBatteryNotified = new();
     /// <summary>由历史记录补出的离线占位条目（见 <see cref="RestoreOfflineTombstones"/>）；过期剔除时只能删这些，不能误删"在位但读不到"的真实设备。</summary>
-    private readonly HashSet<string> _tombstoneIds = new();
+    private readonly ConcurrentDictionary<string, byte> _tombstoneIds = new();
+    private readonly object _stateSync = new();
     private System.Threading.Timer? _pollTimer;
     private System.Threading.Timer? _sampleTimer;
     private System.Threading.Timer? _discoveryTimer;
     private System.Threading.Timer? _cleanupTimer;
     private readonly object _pollSync = new();
-    /// <summary>所有 pass（整轮轮询 / 快速发现）串行执行——插件内部的字典不是线程安全的。</summary>
-    private readonly SemaphoreSlim _passGate = new(1, 1);
+    private readonly Dictionary<IBatteryPlugin, MonitorWorkSlot> _pluginSlots = new();
+    private readonly MonitorWorkSlot _scanSlot = new();
+    private readonly MonitorWorkSlot _bleSlot = new();
+    private readonly MonitorWorkSlot _classicSlot = new();
+    private readonly MonitorWorkSlot _systemSlot = new();
+    private IReadOnlyList<HidDeviceInfo>? _scanSnapshot;
+    private long _settingsRevision;
+    private int _slowPasses;
+    private readonly ReadingSampleRecorder _sampleRecorder = new();
     private Task _currentPoll = Task.CompletedTask;
     private Task _currentDiscovery = Task.CompletedTask;
+    private Task _currentRecovery = Task.CompletedTask;
+    private readonly RecoveryScheduler _recovery;
+    private volatile bool _disposed;
 
     /// <summary>单台设备状态有更新（含低电量提醒触发）。</summary>
     public event Action<DeviceStatus>? DeviceUpdated;
@@ -60,12 +71,17 @@ public sealed class DeviceManager : IDisposable
         _settings = settings;
         _history = history;
         _plugins = DiscoverPlugins();
-        _ble.DeviceUpdated += d => Upsert(d);
+        foreach (var plugin in _plugins) _pluginSlots[plugin] = new MonitorWorkSlot();
+        _recovery = new RecoveryScheduler(RequestRecoveryPassAsync);
+        _ble.DeviceUpdated += Upsert;
         _classic.DeviceUpdated += Upsert;
         _system.DeviceUpdated += Upsert;
         // 罗技等插件的 HID++ 自发通知（插拔电）不走 60 秒轮询，直接推送
         foreach (var p in _plugins)
+        {
             p.StatusPushed += Upsert;
+            if (p is BatteryPluginBase recoverable) recoverable.RecoveryNeeded += OnHidRecoveryNeeded;
+        }
     }
 
     /// <summary>反射发现 Core 程序集里的全部插件。新增品牌 = 加一个 IBatteryPlugin 实现类文件，无需改这里。</summary>
@@ -96,9 +112,9 @@ public sealed class DeviceManager : IDisposable
     }
 
     public IReadOnlyCollection<DeviceStatus> Devices => _devices.Values
-        .OrderByDescending(d => d.IsOnline).ThenBy(d => d.DisplayName).ToList();
+        .OrderByDescending(d => d.IsOnline).ThenBy(d => d.DisplayName).Select(d => d.Clone()).ToList();
 
-    public DeviceStatus? Find(string id) => _devices.TryGetValue(id, out var d) ? d : null;
+    public DeviceStatus? Find(string id) => _devices.TryGetValue(id, out var d) ? d.Clone() : null;
 
     public RemainingTimeEstimateResult GetRemainingTimeEstimate(DeviceStatus device)
     {
@@ -106,6 +122,8 @@ public sealed class DeviceManager : IDisposable
             return new(null, RemainingTimeUnavailableReason.Disabled);
         if (!device.IsOnline)
             return new(null, RemainingTimeUnavailableReason.Offline);
+        if (!ReadingFreshness.IsFresh(device, DateTimeOffset.UtcNow))
+            return new(null, RemainingTimeUnavailableReason.StaleReading);
         if (device.Charging == ChargingState.Charging)
             return new(null, RemainingTimeUnavailableReason.Charging);
         if (device.Charging == ChargingState.Full || device.BatteryPercent >= 100)
@@ -179,7 +197,7 @@ public sealed class DeviceManager : IDisposable
                     LastUpdated = stat.Last,
                     IsOnline = false,
                 });
-                _tombstoneIds.Add(stat.DeviceId);
+                _tombstoneIds.TryAdd(stat.DeviceId, 0);
                 added++;
             }
             if (added > 0)
@@ -199,7 +217,7 @@ public sealed class DeviceManager : IDisposable
         if (_tombstoneIds.Count == 0) return;
         var cutoff = DateTimeOffset.Now - TombstoneWindow;
         var expired = new List<string>();
-        foreach (var id in _tombstoneIds)
+        foreach (var id in _tombstoneIds.Keys)
         {
             if (_devices.TryGetValue(id, out var d) && (d.IsOnline || d.LastUpdated > cutoff)) continue;
             expired.Add(id);
@@ -210,7 +228,7 @@ public sealed class DeviceManager : IDisposable
         {
             _devices.TryRemove(id, out _);
             _remainingTimeEstimates.TryRemove(id, out _);
-            _tombstoneIds.Remove(id);
+            _tombstoneIds.TryRemove(id, out _);
             _lowBatteryNotified.TryRemove(id, out _);
         }
         Log.Info($"离线占位已过期移除 {expired.Count} 台");
@@ -242,6 +260,8 @@ public sealed class DeviceManager : IDisposable
     /// <summary>设置变化后调用（阈值/采样间隔/插件开关）。</summary>
     public void ApplySettings()
     {
+        Interlocked.Increment(ref _settingsRevision);
+        foreach (var plugin in _plugins.Where(p => !IsPluginEnabled(p))) DropDevicesOf(plugin.Name);
         ApplySystemBatterySetting();
         StartTimers();
         RefreshPresentation();
@@ -263,61 +283,37 @@ public sealed class DeviceManager : IDisposable
         if (_devices.TryRemove(SystemBatteryWatcher.DeviceId, out _))
         {
             _remainingTimeEstimates.TryRemove(SystemBatteryWatcher.DeviceId, out _);
-            _tombstoneIds.Remove(SystemBatteryWatcher.DeviceId);
+            _tombstoneIds.TryRemove(SystemBatteryWatcher.DeviceId, out _);
             _lowBatteryNotified.TryRemove(SystemBatteryWatcher.DeviceId, out _);
             Log.Info("已关闭本机电量监控，移除系统电量条目");
             DevicesChanged?.Invoke();
         }
     }
 
-    /// <summary>手动触发一轮立即轮询（UI 刷新按钮）。返回的 Task 在整轮结束后完成（含 BLE 异步补读）；已有轮次在跑时复用其 Task，不静默丢弃。</summary>
+    /// <summary>刷新最多等待八秒；未完成的来源保留所有权，其他来源独立发布。</summary>
     public Task RequestPollAsync()
     {
         lock (_pollSync)
         {
+            if (_disposed) return Task.CompletedTask;
             if (!_currentPoll.IsCompleted) return _currentPoll;
-            _currentPoll = RunExclusiveAsync(PollOnceAsync);
+            _currentPoll = Task.Run(() => RunPassAsync(MonitorPass.Poll));
             return _currentPoll;
         }
     }
 
-    /// <summary>
-    /// 快速发现：让两类插件跑一遍**只认领、不轮询电量**的发现探测（不碰 BLE / 经典蓝牙）：
-    /// SupportsFastDiscovery = 纯被动零写入（雷柏）；SupportsDiscoveryProbe = 要写帧但由 ProbeCooldown 兜住（迈从）。
-    /// 把这类设备的发现时延从 ~60s 压到 ~15s；主轮询在跑时直接返回它。详见 docs/project/code-flow.md §2.1。
-    /// </summary>
+    /// <summary>快速发现沿用插件探测授权与冷却，同一插件已有任务时复用其所有权。</summary>
     public Task RequestDiscoveryAsync()
     {
         lock (_pollSync)
         {
+            if (_disposed) return Task.CompletedTask;
             if (!_currentPoll.IsCompleted) return _currentPoll;
             if (!_currentDiscovery.IsCompleted) return _currentDiscovery;
-            _currentDiscovery = RunExclusiveAsync(DiscoverOnlyAsync);
+            _currentDiscovery = Task.Run(() => RunPassAsync(MonitorPass.Discovery));
             return _currentDiscovery;
         }
     }
-
-    /// <summary>把一段 pass 放到线程池并**串行**执行（闸门保证同一时刻只有一段 pass 在动插件）；用 Task.Run 因调用方可能是 UI 线程而 HID 探测是阻塞 I/O。</summary>
-    private Task RunExclusiveAsync(Func<Task> body) => Task.Run(async () =>
-    {
-        try
-        {
-            await _passGate.WaitAsync().ConfigureAwait(false);
-        }
-        catch (ObjectDisposedException)
-        {
-            return;   // 正在退出，不再执行
-        }
-
-        try
-        {
-            await body().ConfigureAwait(false);
-        }
-        finally
-        {
-            try { _passGate.Release(); } catch (ObjectDisposedException) { /* 退出时竞态，忽略 */ }
-        }
-    });
 
     private bool IsPluginEnabled(IBatteryPlugin plugin)
         => IsPluginEnabledByName(plugin.Name, defaultOn: false);
@@ -346,122 +342,17 @@ public sealed class DeviceManager : IDisposable
         {
             _devices.TryRemove(id, out _);
             _remainingTimeEstimates.TryRemove(id, out _);
-            _tombstoneIds.Remove(id);
+            _tombstoneIds.TryRemove(id, out _);
             _lowBatteryNotified.TryRemove(id, out _);
         }
         Log.Info($"插件 {pluginName} 已禁用，移除其 {dropped.Count} 台设备");
         DevicesChanged?.Invoke();
     }
 
-    /// <summary>只认领、不读电量（见 RequestDiscoveryAsync）。各插件慢探测并行，Upsert 仍在本线程。</summary>
-    private async Task DiscoverOnlyAsync()
-    {
-        try
-        {
-            var hidDevices = HidDeviceScanner.Scan();
-            var tasks = new List<Task<IReadOnlyList<DeviceStatus>>>();
-            foreach (var plugin in _plugins)
-            {
-                // 零写入插件（雷柏）与"写入由 ProbeCooldown 兜住"的插件（迈从）都参与；
-                // 其余会写帧的插件仍只吃 60 秒主轮询，避免成倍抬高写入频率。
-                if (!plugin.SupportsFastDiscovery && !plugin.SupportsDiscoveryProbe) continue;
-                if (!IsPluginEnabled(plugin)) continue;
-                tasks.Add(AttachSafeAsync(plugin, hidDevices, "快速发现"));
-            }
-
-            var results = await Task.WhenAll(tasks).ConfigureAwait(false);
-            foreach (var claimed in results)
-            {
-                foreach (var d in claimed)
-                    Upsert(d);
-            }
-        }
-        catch (Exception ex)
-        {
-            Log.Error("快速发现周期异常", ex);
-        }
-    }
-
-    private async Task PollOnceAsync()
-    {
-        try
-        {
-            var hidDevices = HidDeviceScanner.Scan();
-
-            var attachTasks = new List<Task<(IBatteryPlugin Plugin, IReadOnlyList<DeviceStatus> Claimed)>>();
-            foreach (var plugin in _plugins)
-            {
-                bool enabled = IsPluginEnabled(plugin);
-                try
-                {
-                    if (!enabled)
-                    {
-                        plugin.Detach();
-                        _claims.ReleaseAll(plugin.Name);
-                        DropDevicesOf(plugin.Name);
-                        continue;
-                    }
-                    attachTasks.Add(AttachLabeledAsync(plugin, hidDevices));
-                }
-                catch (Exception ex)
-                {
-                    Log.Error($"插件 {plugin.Name} 轮询失败", ex);
-                }
-            }
-
-            var attached = await Task.WhenAll(attachTasks).ConfigureAwait(false);
-            foreach (var (plugin, claimed) in attached)
-            {
-                try
-                {
-                    // Attach 返回值立即 Upsert：新设备即时进 UI；FreshlyClaimed 本轮 Poll 跳过。
-                    foreach (var d in claimed)
-                        Upsert(d);
-                    foreach (var d in plugin.Poll())
-                        Upsert(d);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error($"插件 {plugin.Name} 轮询失败", ex);
-                }
-            }
-
-            // 必须 await：以前 fire-and-forget 会让"刷新"在 BLE 侧还没跑完就返回
-            await _ble.PollConnectedAsync();
-            _classic.RefreshBattery();
-            if (_settings.MonitorSystemBattery) _system.Refresh();
-            DevicesChanged?.Invoke();
-        }
-        catch (Exception ex)
-        {
-            Log.Error("轮询周期异常", ex);
-        }
-    }
-
-    private async Task<IReadOnlyList<DeviceStatus>> AttachSafeAsync(
-        IBatteryPlugin plugin, IReadOnlyList<HidDeviceInfo> hidDevices, string label)
-    {
-        try
-        {
-            return await plugin.AttachAsync(hidDevices, _claims).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            Log.Error($"插件 {plugin.Name} {label}失败", ex);
-            return Array.Empty<DeviceStatus>();
-        }
-    }
-
-    private async Task<(IBatteryPlugin Plugin, IReadOnlyList<DeviceStatus> Claimed)> AttachLabeledAsync(
-        IBatteryPlugin plugin, IReadOnlyList<HidDeviceInfo> hidDevices)
-    {
-        var claimed = await AttachSafeAsync(plugin, hidDevices, "认领").ConfigureAwait(false);
-        return (plugin, claimed);
-    }
-
     /// <summary>立即按保留天数清理历史。设置保存后调用，也由 6 小时定时任务调用。</summary>
     public void CleanupHistoryNow()
     {
+        if (_disposed) return;
         try
         {
             var removed = _history.CleanupOlderThan(DateTimeOffset.Now.AddDays(-_settings.HistoryRetentionDays));
@@ -478,13 +369,17 @@ public sealed class DeviceManager : IDisposable
     {
         try
         {
-            foreach (var d in _devices.Values)
+            lock (_stateSync)
             {
-                if (d.IsOnline && d.BatteryPercent.HasValue)
-                    _history.Insert(DeviceCustomizationResolver.ApplyName(d, _settings.DeviceCustomizations));
-                RefreshRemainingTimeEstimate(d, notify: true);
+                if (_disposed) return;
+                foreach (var d in _devices.Values)
+                {
+                    InsertFreshSample(d);
+                    RefreshRemainingTimeEstimate(d, notify: true);
+                }
+                ExpireTombstones();
             }
-            ExpireTombstones();
+            RefreshPresentation();
         }
         catch (Exception ex)
         {
@@ -492,46 +387,65 @@ public sealed class DeviceManager : IDisposable
         }
     }
 
+    private void InsertFreshSample(DeviceStatus status) =>
+        _sampleRecorder.Record(DeviceCustomizationResolver.ApplyName(status, _settings.DeviceCustomizations),
+            DateTimeOffset.UtcNow, _history.Insert);
+
     private void Upsert(DeviceStatus incoming)
     {
-        // 数据源（插件/watcher）会复用并原地改写同一个 DeviceStatus 实例。直接把它存进 _devices，
-        // 后续再比较就变成"同一对象和自己比"，changed 恒为假（历史即写 / DeviceUpdated / 骤降保护全失效）。
-        // 所以先快照 incoming 当"新值"，库里存的始终是独立副本当"旧值"——详见 docs/project/architecture.md §6。
+        if (_disposed) return;
+        // 来源可能复用实例，必须保留独立旧值供变化判定；见 docs/project/architecture.md §6。
+        var owner = OwnerOf(incoming.Id);
+        if (_plugins.Any(p => string.Equals(p.Name, owner, StringComparison.OrdinalIgnoreCase))
+            && !IsPluginEnabledByName(owner, false)) return;
+        lock (_stateSync) UpsertCore(incoming);
+    }
+
+    private void UpsertCore(DeviceStatus incoming)
+    {
+        if (_disposed || incoming.Id == SystemBatteryWatcher.DeviceId && !_settings.MonitorSystemBattery) return;
+        var owner = _plugins.FirstOrDefault(p => string.Equals(p.Name, OwnerOf(incoming.Id), StringComparison.OrdinalIgnoreCase));
+        if (owner != null && !IsPluginEnabled(owner)) return;
         var snapshot = incoming.Clone();
         var status = _devices.GetOrAdd(incoming.Id, snapshot);
         bool isNew = ReferenceEquals(status, snapshot);
+        if (!isNew && snapshot.LastUpdated < status.LastUpdated) return;
 
         // 新设备立即通知 UI（watcher/插件首轮上报不等下一分钟轮询）
         if (isNew)
         {
             DevicesChanged?.Invoke();
-            DeviceUpdated?.Invoke(status);
+            DeviceUpdated?.Invoke(status.Clone());
         }
 
         int? previousPercent = isNew ? null : status.BatteryPercent;
         var previousKind = status.Kind;
+        var previousReading = isNew ? null : status.BatteryObservedAt;
 
         bool changed = DeviceChangeDetector.HasChanged(status, snapshot);
         // 原地同步（Kind/Protocol 的"声明覆盖猜测"规则见 DeviceStatusMerger）
+        status = status.Clone();
         DeviceStatusMerger.Apply(status, snapshot);
+        if (isNew || changed) status.StateChangedAt = snapshot.LastUpdated;
+        _devices[status.Id] = status;
 
         // 占位条目一旦被真实来源接管（重新上线），就不再按占位规则过期剔除
-        if (status.IsOnline) _tombstoneIds.Remove(status.Id);
+        if (status.IsOnline) _tombstoneIds.TryRemove(status.Id, out _);
 
         if (changed)
         {
             // 电量变化立即写一条历史（含从离线恢复）
-            if (status.BatteryPercent.HasValue)
-                _history.Insert(DeviceCustomizationResolver.ApplyName(status, _settings.DeviceCustomizations));
-            DeviceUpdated?.Invoke(status);
+            InsertFreshSample(status);
+            DeviceUpdated?.Invoke(status.Clone());
         }
-        else if (status.Kind != previousKind)
+        else if (status.Kind != previousKind || status.BatteryObservedAt.HasValue)
         {
-            // 类型后解析出来（Unknown → Mouse）：电量没变也要换图标，但不写历史
-            DeviceUpdated?.Invoke(status);
+            // 类型补全与同值新读数仍需刷新展示，历史由采样节拍记录。
+            DeviceUpdated?.Invoke(status.Clone());
         }
 
-        CheckLowBattery(status, previousPercent);
+        if (isNew) InsertFreshSample(status);
+        if (status.BatteryObservedAt != previousReading) CheckLowBattery(status, previousPercent);
         RefreshRemainingTimeEstimate(status, notify: true);
     }
 
@@ -570,7 +484,7 @@ public sealed class DeviceManager : IDisposable
             _lowBatteryNotified.TryRemove(status.Id, out _);
             return;
         }
-        if (!status.IsOnline) return;
+        if (!ReadingFreshness.IsFresh(status, DateTimeOffset.UtcNow)) return;
         if (status.BatteryPercent is not { } percent) return;
 
         // 回到阈值之上（或充电/满电）→ 复位"已提醒"标记，下次跌破再提醒一次。
@@ -593,13 +507,20 @@ public sealed class DeviceManager : IDisposable
         // 跨过阈值只提醒一次（TryAdd 兼任"未提醒过"的判定，天然幂等）
         if (_lowBatteryNotified.TryAdd(status.Id, true))
         {
-            LowBatteryDetected?.Invoke(status);
+            LowBatteryDetected?.Invoke(status.Clone());
             Log.Info($"低电量提醒: {status.DisplayName} {percent}%");
         }
     }
 
     public void Dispose()
     {
+        lock (_pollSync)
+        {
+            if (_disposed) return;
+            _disposed = true;
+        }
+        lock (_stateSync) _remainingTimeEstimates.Clear();
+        _recovery.Dispose();
         _pollTimer?.Dispose();
         _sampleTimer?.Dispose();
         _discoveryTimer?.Dispose();
@@ -607,11 +528,25 @@ public sealed class DeviceManager : IDisposable
         foreach (var p in _plugins)
         {
             p.StatusPushed -= Upsert;
-            p.Detach();
+            if (p is BatteryPluginBase recoverable) recoverable.RecoveryNeeded -= OnHidRecoveryNeeded;
+            try
+            {
+                if (p is BatteryPluginBase stoppable) stoppable.BeginShutdown();
+            }
+            catch (Exception ex) { Log.Error($"插件 {p.Name} 停止 I/O 失败", ex); }
         }
-        _ble.Dispose();
-        _classic.Dispose();
-        _system.Dispose();
-        _passGate.Dispose();
+        _ble.DeviceUpdated -= Upsert;
+        _classic.DeviceUpdated -= Upsert;
+        _system.DeviceUpdated -= Upsert;
+        foreach (var release in new Action[] { _ble.Dispose, _classic.Dispose, _system.Dispose })
+        {
+            try { release(); }
+            catch (Exception ex) { Log.Error("设备监视器退出收尾失败", ex); }
+        }
+        _scanSlot.Stop();
+        _bleSlot.Stop();
+        _classicSlot.Stop();
+        _systemSlot.Stop();
+        foreach (var plugin in _plugins) _ = DisposePluginAsync(plugin);
     }
 }

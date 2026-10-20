@@ -18,6 +18,7 @@ public sealed class HautePlugin : BatteryPluginBase
     public override bool SupportsFastDiscovery => true;
     protected override bool WritesEnabled => false;
     protected override bool ProbeWrites => false;
+    protected override bool SupportsReadOnlyHealthCheck => true;
     protected override TimeSpan ProbeCooldown => TimeSpan.FromSeconds(5);
 
     protected override string BuildDeviceId(HidDeviceHandle handle) => ReadDeviceId(handle);
@@ -44,8 +45,6 @@ public sealed class HautePlugin : BatteryPluginBase
     protected override (int? Percent, ChargingState Charging)? PollDevice(TrackedDevice dev)
     {
         var read = ReadStatus(dev.Handle);
-        if (!read.HasValue)
-            read = RecoverStatus(dev);
         if (read.HasValue)
         {
             ReportPollAnswered(dev);
@@ -68,38 +67,6 @@ public sealed class HautePlugin : BatteryPluginBase
             Log.Warn($"Haute 状态句柄不可用: {ex.Message}");
         }
         return null;
-    }
-
-    private static (int? Percent, ChargingState Charging)? RecoverStatus(TrackedDevice dev)
-    {
-        HidDeviceHandle? replacement = null;
-        try
-        {
-            // 相同设备路径可能保留失效句柄；只重开已认领接口，不把一次通信失败当作手柄断开。
-            replacement = dev.Info.Open();
-            var firmware = replacement.GetFeature(HauteCodec.FirmwareReportId);
-            if (firmware == null || !HauteCodec.IsHauteFirmware(firmware)) return null;
-            if (ReadDeviceId(replacement) != dev.Status.Id)
-            {
-                Log.Warn("Haute 重开的接口属于另一接收器，保留原设备离线状态");
-                RequestReprobe(dev);
-                return null;
-            }
-            var read = ReadStatus(replacement);
-            if (!read.HasValue) return null;
-            var previous = dev.Handle;
-            dev.Handle = replacement;
-            replacement = null;
-            previous.Dispose();
-            Log.Info("Haute 已重开状态接口，恢复电量读取");
-            return read;
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"Haute 状态接口重开失败: {ex.Message}");
-            return null;
-        }
-        finally { replacement?.Dispose(); }
     }
 
     protected override string BuildDisplayName(HidDeviceInfo info) => "DualSense (Haute Adapter 4DS)";

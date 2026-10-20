@@ -28,13 +28,13 @@
 | **CR-69** | 社区 PR #16（设备管理）未纳入：删离线条目会连带删历史（虽先 `VACUUM INTO` 备份），"只显示在线""电量条对齐"边界未定。冲突面在文档 + `BatteryPluginBase` + `AppSettings` | PR #16 提交 `6908997f` | `open` |
 | **CR-70** | 社区 PR #15 的 BLE 大改未纳入（`BleBatteryWatcher` +38/-22、`WatcherProps`、`DeviceKindGuesser`、`DeviceSourceInfo`、`SettingsPage`）。通用 GATT 路径已能读标准电池服务，故本轮只摘设备插件；蓝牙通道要单独一轮 | PR #15 | `open` |
 | **CR-71** | 社区 issue #12（任务栏贴片避让托盘图标）只有根因与修法描述，没有代码。`TaskbarLayout.Place` 现在固定贴托盘左侧，与 CR-39 同源 | issue #12、`Services/TaskbarLayout.cs:Place` | `open` |
-| **CR-72** | P1：单设备慢调用/挂起可占住全局 pass，阻塞后续轮询与发现；需分设备隔离、可取消 I/O 和超时后的旧任务隔离，社区断电冻结现象的确切触发点仍待复现 | `DeviceManager:RunExclusiveAsync/PollOnceAsync`、`HidDeviceHandle:GetFeature/WriteOutput`、issue #11 | `open` |
+| **CR-72** | P1：已拆除全局 pass，按插件/扫描/蓝牙来源保留唯一在途任务，刷新有限等待且完成即发布；同品牌内单设备挂起仍会阻塞该插件，CI/真机待验 | `DeviceManager.Monitoring`、`MonitorWorkSlot`；见 `archive/monitoring-isolation-2026-10-20.md` | `doing` |
 | **CR-74** | Haute 运行日志已记录 Win32 1167 后恢复，芯片身份修复已部署且用户确认可提交；长期休眠场景继续观察，最初三次失败缺历史错误码 | `HautePlugin.cs:ReadStatus/RecoverStatus`，`hardware/protocols.md` §15 | `open` |
-| **CR-78** | P1：缺少系统睡眠恢复、会话解锁后的统一健康检查与有界恢复调度，仍依赖普通 15/60 秒定时器 | `DeviceManager:Start/StartTimers`、`App.xaml.cs`；见 `archive/stability-recovery-2026-10-20.md` | `open` |
-| **CR-79** | P1：HID 读错误与普通超时均返回 null，路径仍在时基类继续复用旧句柄；尚无通用失效句柄重开与重探流程 | `HidDeviceHandle:ReadInputAsync`、`BatteryPluginBase:AttachAsync/Poll` | `open` |
-| **CR-80** | P1：两个蓝牙 watcher 在真正启动前置 _started，创建失败后无法重试，也不处理 Stopped/Aborted 恢复 | `BleBatteryWatcher:Start`、`BluetoothClassicWatcher:Start` | `open` |
-| **CR-81** | P1：BLE GATT 与经典蓝牙连接确认结果无连接代次校验，断连/移除后旧异步结果可能重新上报在线 | `BleBatteryWatcher:ReadBatteryViaGattAsync/HandleRemoved`、`BluetoothClassicWatcher:VerifyConnectionAndAddAsync` | `open` |
-| **CR-82** | P2：在线标志、状态更新时间与电量读数新鲜度未分开，无法可靠区分有效缓存、重连待确认与监控停滞 | `DeviceStatus:LastUpdated/IsOnline`、`BatteryPluginBase:TryApplyReading/MarkOffline`、`DeviceManager:SafeSample` | `open` |
+| **CR-78** | P1：已接电源恢复/当前会话解锁/HID 插拔通知，按 1/3/10/30 秒合并检查，旧计时器与在途轮次有代次及串行保护；CI、真实休眠与 Modern Standby 待验 | `RecoveryScheduler`、`SystemRecoveryNotifications`、`DeviceManager.Recovery`；见 `archive/hid-system-recovery-2026-10-20.md` | `doing` |
+| **CR-79** | P1：已区分 HID 超时和失效错误，退役后等待旧 I/O/监听收尾再按原授权、熔断与冷却重探，Haute 复用通用路径；故障注入用例与真机待验 | `HidDeviceHandle`、`BatteryPluginBase.Recovery`；见 `archive/hid-system-recovery-2026-10-20.md` | `doing` |
+| **CR-80** | P1：已实现蓝牙 watcher 退避重建、停止屏障与旧事件屏蔽，待新增故障注入用例在 CI 执行及真实蓝牙开关/恢复验收后关闭 | `Ble/WatcherRecovery.cs`、`WinRtWatcherSession.cs`；见 `archive/bluetooth-recovery-2026-10-20.md` | `doing` |
+| **CR-81** | P1：已实现连接代次与锁内回写校验，覆盖断连、移除、重建和退出后的晚到结果；CI 与真实 WinRT 时序尚待验证 | `Ble/ConnectionEpochs.cs`、两个蓝牙 watcher；见 `archive/bluetooth-recovery-2026-10-20.md` | `doing` |
+| **CR-82** | P2：已分离电量观察、连接证据及状态变化时间，5 分钟过期展示、暂停提醒/估算及缓存去重采样；CI/系统属性新鲜度与真机待验 | `ReadingFreshness`、`ReadingSampleRecorder`、`DeviceStatus`；见 `archive/monitoring-isolation-2026-10-20.md` | `doing` |
 | **CR-83** | P2：除 Haute 等特例外仍按接口路径生成设备 ID，路径变化会拆分设备条目、历史和自定义名称；需可验证的物理身份与保守回退 | `BatteryPluginBase:BuildDeviceId`、`MchosePlugin:BuildDeviceId` | `open` |
 
 ## 重构候选（未做）

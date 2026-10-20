@@ -19,6 +19,7 @@
 - [logging.md](dev/logging.md)：日志级别、文件位置、保留和排障用法。
 - [comment-style.md](dev/comment-style.md)：代码注释规范。
 - [review-standard.md](dev/review-standard.md)：审查标准、红线和闭环流程。
+- [stability-recovery.md](dev/stability-recovery.md)：Fork 日常稳定性优化路线、蓝牙生命周期和连接代次契约。
 
 ## 硬件协议与安全
 

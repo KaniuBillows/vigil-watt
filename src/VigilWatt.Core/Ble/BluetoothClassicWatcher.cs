@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using VigilWatt.Core.Models;
 using VigilWatt.Core.Utils;
 using Windows.Devices.Bluetooth;
@@ -13,9 +12,10 @@ namespace VigilWatt.Core.Ble;
 /// </summary>
 public sealed class BluetoothClassicWatcher : IDisposable
 {
-    private DeviceWatcher? _watcher;
-    private bool _started;
-    private readonly ConcurrentDictionary<string, DeviceStatus> _devices = new();
+    private readonly WatcherRecovery _recovery;
+    private readonly ConnectionEpochs _connections;
+    private readonly Dictionary<string, DeviceStatus> _devices = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConnectionVerificationQueue _verifications;
 
     public event Action<DeviceStatus>? DeviceUpdated;
 
@@ -29,11 +29,23 @@ public sealed class BluetoothClassicWatcher : IDisposable
 
     private string? _batteryProp;
 
-    public void Start()
+    public BluetoothClassicWatcher()
     {
-        if (_started) return;
-        _started = true;
+        _recovery = new WatcherRecovery("经典蓝牙", CreateSession, InvalidateConnections);
+        _connections = new ConnectionEpochs(_recovery.SyncRoot);
+        _verifications = new ConnectionVerificationQueue(_recovery.SyncRoot);
+    }
 
+    public void Start() => _recovery.Start();
+
+    private void InvalidateConnections()
+    {
+        _connections.Clear();
+        _verifications.Clear();
+    }
+
+    private IWatcherSession CreateSession()
+    {
         var selector = BluetoothDevice.GetDeviceSelector();
         DeviceWatcher? watcher = null;
         foreach (var props in BatteryPropCandidates)
@@ -41,7 +53,7 @@ public sealed class BluetoothClassicWatcher : IDisposable
             try
             {
                 watcher = DeviceInformation.CreateWatcher(selector, props, DeviceInformationKind.AssociationEndpoint);
-                if (props.Length == 3) _batteryProp = props[1];
+                _batteryProp = props.Length == 3 ? props[1] : null;
                 Log.Info($"经典蓝牙 watcher 属性集可用: {string.Join(", ", props)}");
                 break;
             }
@@ -51,18 +63,10 @@ public sealed class BluetoothClassicWatcher : IDisposable
                 watcher = null;
             }
         }
-        if (watcher == null)
-        {
-            Log.Error("经典蓝牙 DeviceWatcher 无法创建，经典蓝牙监控不可用");
-            return;
-        }
-
-        watcher.Added += (w, info) => HandleDevice(info.Id, info.Properties, info.Name);
-        watcher.Updated += (w, update) => HandleDevice(update.Id, update.Properties, null);
-        watcher.Removed += (w, update) => HandleRemoved(update.Id);
-        watcher.Start();
-        _watcher = watcher;
-        Log.Info("经典蓝牙 DeviceWatcher 已启动");
+        if (watcher == null) throw new InvalidOperationException("经典蓝牙 DeviceWatcher 无可用属性集");
+        return new WinRtWatcherSession(watcher,
+            (session, id, props, name) => _recovery.RunIfCurrent(session, () => HandleDevice(id, props, name)),
+            (session, id) => _recovery.RunIfCurrent(session, () => HandleRemoved(id)));
     }
 
     private void HandleDevice(
@@ -70,25 +74,33 @@ public sealed class BluetoothClassicWatcher : IDisposable
     {
         // Updated 事件只带变化的属性：IsConnected 缺失时沿用现状，不能当成断开
         bool? connected = WatcherProps.ReadConnected(props);
+        long epoch = _connections.Observe(id, connected ??
+            (_devices.TryGetValue(id, out var prior) && !prior.IsOnline ? (bool?)false : null));
 
         if (connected == false)
         {
+            _verifications.Invalidate(id);
             if (_devices.TryGetValue(id, out var tracked) && tracked.IsOnline)
             {
                 tracked.IsOnline = false;
+                tracked.ReadingConnectionConfirmed = false;
                 tracked.LastUpdated = DateTimeOffset.Now;
+                tracked.ConnectionObservedAt = tracked.LastUpdated;
                 Log.Info($"经典蓝牙设备离线: {tracked.DisplayName}");
-                DeviceUpdated?.Invoke(tracked);
+                DeviceUpdated?.Invoke(tracked.Clone());
             }
             return;
         }
+        if (!_connections.IsCurrent(id, epoch)) return;
 
         // 新增设备必须"确认真的连着"才进列表：配对但已断开的耳机，其 HFP 网关节点上仍留着上次的电量
         // （真机 W820NB 明明没连，却以 50% 在线出现在列表里）。
         bool isNew = !_devices.TryGetValue(id, out var status);
         if (isNew && !connectionVerified)
         {
-            _ = VerifyConnectionAndAddAsync(id, props, name);
+            var request = _verifications.Enqueue(id, props, name, epoch);
+            if (request != null)
+                _ = VerifyConnectionAndAddAsync(id, request.Props, request.Name, epoch);
             return;
         }
 
@@ -96,6 +108,7 @@ public sealed class BluetoothClassicWatcher : IDisposable
         var nodeInfo = TryGetDevNodeInfo(id);
 
         int? percent = WatcherProps.ReadBattery(props, _batteryProp);
+        bool batteryEvent = percent.HasValue;
 
         // AEP 属性拿不到时，走 HFP 网关设备节点的 DEVPKEY_Device_BatteryLevel
         percent ??= nodeInfo?.BatteryPercent;
@@ -123,20 +136,41 @@ public sealed class BluetoothClassicWatcher : IDisposable
         bool shouldNotify = isNew || wasOffline || batteryChanged || kindChanged;
 
         status.IsOnline = true;
+        status.ConnectionObservedAt = DateTimeOffset.Now;
         status.LastUpdated = DateTimeOffset.Now;
-        if (percent.HasValue) status.BatteryPercent = percent;
+        if (percent.HasValue)
+        {
+            status.BatteryPercent = percent;
+            if (batteryEvent || batteryChanged || isNew) status.ObserveBattery(DateTimeOffset.Now);
+        }
 
-        if (shouldNotify)
+        if (shouldNotify || percent.HasValue)
         {
             if (isNew) Log.Info($"经典蓝牙设备发现: {status.DisplayName} 电量={(percent.HasValue ? $"{percent}%" : "--")}");
             else if (wasOffline) Log.Info($"经典蓝牙设备上线: {status.DisplayName}");
-            DeviceUpdated?.Invoke(status);
+            DeviceUpdated?.Invoke(status.Clone());
         }
     }
 
     /// <summary>新增设备前的连接确认：<c>Added</c> 首帧的 <c>IsConnected</c> 可能缺失，不能只看它；直接问系统要"当前已连接"集合（只读枚举，不建立连接）。</summary>
     private async Task VerifyConnectionAndAddAsync(
-        string id, IReadOnlyDictionary<string, object> props, string? name)
+        string id, IReadOnlyDictionary<string, object> props, string? name, long epoch)
+    {
+        try { await VerifyConnectionCoreAsync(id, props, name, epoch).ConfigureAwait(false); }
+        catch (Exception ex) { Log.Error($"经典蓝牙连接确认失败: {id}", ex); }
+        finally
+        {
+            lock (_recovery.SyncRoot)
+            {
+                var next = _verifications.Complete(id, epoch,
+                    token => _connections.IsCurrent(id, token) && _recovery.IsRunning);
+                if (next != null) _ = VerifyConnectionAndAddAsync(id, next.Props, next.Name, next.Epoch);
+            }
+        }
+    }
+
+    private async Task VerifyConnectionCoreAsync(
+        string id, IReadOnlyDictionary<string, object> props, string? name, long epoch)
     {
         bool? aep = WatcherProps.ReadConnected(props);
         if (aep == false)   // AEP 明说断开，不用再问
@@ -148,9 +182,11 @@ public sealed class BluetoothClassicWatcher : IDisposable
         bool connected;
         try
         {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
             var list = await DeviceInformation.FindAllAsync(
                 BluetoothDevice.GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus.Connected),
-                new[] { WatcherProps.Connected }, DeviceInformationKind.AssociationEndpoint);
+                new[] { WatcherProps.Connected }, DeviceInformationKind.AssociationEndpoint)
+                .AsTask(timeout.Token).ConfigureAwait(false);
             connected = list.Any(d => string.Equals(d.Id, id, StringComparison.OrdinalIgnoreCase));
         }
         catch (Exception ex)
@@ -167,7 +203,11 @@ public sealed class BluetoothClassicWatcher : IDisposable
             return;
         }
 
-        HandleDevice(id, props, name, connectionVerified: true);
+        _connections.TryCommit(id, epoch, () =>
+        {
+            if (_verifications.Latest(id, epoch) is { } latest)
+                HandleDevice(id, latest.Props, latest.Name, connectionVerified: true);
+        });
     }
 
     /// <summary>取显示名，来源按可靠性排序：WinRT 名字 → <c>ItemNameDisplay</c> → 注册表配对名 → 格式化 MAC；每个候选都过 <see cref="ClassicDeviceName.IsPlaceholder"/>（WinRT 在友好名未解析时会把 AEP 设备 ID 当名字返回）。</summary>
@@ -198,12 +238,16 @@ public sealed class BluetoothClassicWatcher : IDisposable
     private void HandleRemoved(string id)
     {
         // 设备不再匹配 selector（断开/取消配对）：发离线而不是静默删除，保持 DeviceManager 里有据可查
-        if (_devices.TryRemove(id, out var tracked) && tracked.IsOnline)
+        _connections.Remove(id);
+        _verifications.Invalidate(id);
+        if (_devices.Remove(id, out var tracked) && tracked.IsOnline)
         {
             tracked.IsOnline = false;
+            tracked.ReadingConnectionConfirmed = false;
             tracked.LastUpdated = DateTimeOffset.Now;
+            tracked.ConnectionObservedAt = tracked.LastUpdated;
             Log.Info($"经典蓝牙设备移除: {tracked.DisplayName}");
-            DeviceUpdated?.Invoke(tracked);
+            DeviceUpdated?.Invoke(tracked.Clone());
         }
     }
 
@@ -232,7 +276,12 @@ public sealed class BluetoothClassicWatcher : IDisposable
     /// <summary>周期刷新（轮询时调用）：watcher 只在属性变化时推事件，这里主动重读一次，有变化才通知。</summary>
     public void RefreshBattery()
     {
-        if (!_started) return;
+        lock (_recovery.SyncRoot) RefreshBatteryCore();
+    }
+
+    private void RefreshBatteryCore()
+    {
+        if (!_recovery.IsRunning) return;
         foreach (var (id, status) in _devices.ToArray())
         {
             if (!status.IsOnline) continue;
@@ -247,16 +296,17 @@ public sealed class BluetoothClassicWatcher : IDisposable
                     status.Name = paired!;
                     status.LastUpdated = DateTimeOffset.Now;
                     Log.Info($"经典蓝牙设备名补全: {status.DisplayName}");
-                    DeviceUpdated?.Invoke(status);
+                    DeviceUpdated?.Invoke(status.Clone());
                 }
             }
 
             var nodeInfo = TryGetDevNodeInfo(id);
             bool changed = ApplyKindAndProtocol(status, nodeInfo);
 
-            if (nodeInfo?.BatteryPercent is { } percent && status.BatteryPercent != percent)
+            if (nodeInfo?.BatteryPercent is { } percent && (status.BatteryPercent != percent || status.BatteryObservedAt == null))
             {
                 status.BatteryPercent = percent;
+                status.ObserveBattery(DateTimeOffset.Now);
                 Log.Info($"经典蓝牙电量(HFP 节点): {status.DisplayName} {percent}%");
                 changed = true;
             }
@@ -264,14 +314,18 @@ public sealed class BluetoothClassicWatcher : IDisposable
             if (!changed) continue;
 
             status.LastUpdated = DateTimeOffset.Now;
-            DeviceUpdated?.Invoke(status);
+            DeviceUpdated?.Invoke(status.Clone());
         }
     }
 
-    public IReadOnlyList<DeviceStatus> Snapshot() => _devices.Values.ToList();
+    public IReadOnlyList<DeviceStatus> Snapshot()
+    {
+        lock (_recovery.SyncRoot) return _devices.Values.Select(s => s.Clone()).ToList();
+    }
 
     public void Dispose()
     {
-        _watcher?.Stop();
+        _recovery.Dispose();
     }
+
 }

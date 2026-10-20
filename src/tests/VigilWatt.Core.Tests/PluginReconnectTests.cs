@@ -127,7 +127,9 @@ public class PluginReconnectTests : IDisposable
         var claims = new DeviceClaimRegistry();
         var first = Assert.Single(await plugin.AttachAsync([Info("HID#A")], claims));
         var second = Assert.Single(await plugin.AttachAsync([Info("hid#a")], claims));
-        Assert.Same(first, second);
+        Assert.NotSame(first, second);
+        Assert.Equal(first.Id, second.Id);
+        Assert.Equal(first.BatteryPercent, second.BatteryPercent);
         Assert.Single(plugin.Streams);
         Assert.False(claims.TryClaim("hid#a", "Other"));
         Assert.False(Assert.Single(await plugin.AttachAsync([], claims)).IsOnline);

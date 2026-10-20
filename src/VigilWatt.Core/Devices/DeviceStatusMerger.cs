@@ -9,9 +9,7 @@ namespace VigilWatt.Core.Devices;
 /// </summary>
 public static class DeviceStatusMerger
 {
-    /// <summary>
-    /// 把 <paramref name="incoming"/> 的字段同步进已存在的 <paramref name="status"/>（原地改）。⚠️ Kind / Protocol 是"声明覆盖猜测"（非 Unknown / 非空才覆盖）：既防墓碑的错误猜测冻结到永远，也防未声明来源洗掉已知类型——详见 docs/project/architecture.md §6。
-    /// </summary>
+    /// <summary>未知类型或空协议不得覆盖已知声明，详见 docs/project/architecture.md §6。</summary>
     public static void Apply(DeviceStatus status, DeviceStatus incoming)
     {
         status.Name = incoming.Name;
@@ -21,5 +19,9 @@ public static class DeviceStatusMerger
         if (incoming.Protocol.Length > 0) status.Protocol = incoming.Protocol;
         status.LastUpdated = incoming.LastUpdated;
         status.IsOnline = incoming.IsOnline;
+        status.BatteryObservedAt = incoming.BatteryObservedAt;
+        status.ConnectionObservedAt = incoming.ConnectionObservedAt;
+        status.ReadingConnectionConfirmed = incoming.IsOnline && incoming.ReadingConnectionConfirmed;
+        if (incoming.StateChangedAt.HasValue) status.StateChangedAt = incoming.StateChangedAt;
     }
 }

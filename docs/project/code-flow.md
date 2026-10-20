@@ -7,42 +7,36 @@
 1. **单实例检查**：命名 Mutex `VigilWatt_SingleInstance`，已存在则直接退出。
 2. `new AppServices()`：加载 AppSettings → 打开 HistoryStore（建库/建表）→ `new DeviceManager(settings, history)`（构造里挂 BLE + 经典蓝牙的 DeviceUpdated → Upsert）。
 3. `Manager.Start()` → `BleBatteryWatcher.Start()` + `BluetoothClassicWatcher.Start()`（见 §3）+ 启动三个定时器：
-   - 轮询：**300ms 后首跑**（探测已并行/短路，不再需要 2 秒缓冲），之后每 **1 分钟**（`RequestPollAsync` → `PollOnceAsync`）
-   - 快速发现：**15 秒**（`RequestDiscoveryAsync` → `DiscoverOnlyAsync`，见 §2.1）
+   - 轮询：**300ms 后首跑**（探测已并行/短路，不再需要 2 秒缓冲），之后每 **1 分钟**（`RequestPollAsync` → `RunPassAsync`）
+   - 快速发现：**15 秒**（`RequestDiscoveryAsync` → `RunPassAsync(Discovery)`，见 §2.1）
    - 采样：1 分钟后首跑，之后每 `SampleIntervalMinutes` 分钟（`SafeSample`）
 4. `new MainWindow()`（NavigationView 三页），然后 TrayService.Initialize()（Win32 消息窗口 + Shell_NotifyIcon）。
 5. `MainWindow.Activate()` → 若 `StartMinimized` 立即 `AppWindow.Hide()`（关窗也是隐藏，见 §7）。
 6. 若 `WidgetEnabled` → `new WidgetWindow()` + Activate（DIP×缩放尺寸、普通层级不置顶、工具窗口样式）。
 7. 全程异常兜底：App.UnhandledException / AppDomain.UnhandledException / TaskScheduler.UnobservedTaskException → Log.Error。
 
-## 2. 轮询主循环（DeviceManager.RequestPollAsync → PollOnceAsync，每 1 分钟 + 手动刷新共用）
+## 2. 轮询主循环（DeviceManager.RequestPollAsync → RunPassAsync，每 1 分钟 + 手动刷新共用）
 
 ```
-RequestPollAsync                       # 若已有整轮在跑 → 直接复用它的 Task 返回（不静默丢弃）
-└── RunExclusiveAsync(PollOnceAsync)   # Task.Run + _passGate(SemaphoreSlim) 串行：同一时刻只有一段 pass 在动插件
-PollOnceAsync
-├── HidDeviceScanner.Scan()            # 枚举路径；路径未变则复用元数据缓存，不再 CreateFile
-├── 未启用插件 → Detach + ReleaseAll（串行）
-├── Task.WhenAll(各启用插件 AttachAsync)  # 不同接收器并行探测；同一插件内候选仍串行
-│      → 全部结束后再逐个 Upsert（历史写入不跨任务）
-├── foreach 插件 Poll()                # 已认领设备仍按插件顺序轮询
-├── await _ble.PollConnectedAsync()
-├── _classic.RefreshBattery()
-└── DevicesChanged?.Invoke()
+RequestPollAsync                       # 已有观察轮次时复用它；最多等待 8 秒
+└── RunPassAsync(Poll)
+    ├── 扫描 slot → HidDeviceScanner.Scan
+    ├── 每个插件自己的 slot
+    │   ├── 禁用 → 所有者内 Detach，撤下条目
+    │   ├── 新清单最多等 2 秒，完成后 AttachAsync → 独立 Upsert
+    │   └── Poll → 独立 Upsert
+    ├── BLE slot → Start / PollConnectedAsync
+    ├── 经典蓝牙 slot → Start / RefreshBattery
+    └── 系统电池 slot → Refresh
 ```
 
-`BatteryPluginBase.AttachAsync` 先释放本轮已消失接口的监听、句柄与认领，再探测新接口；同一身份重连成功时，新状态替换返回列表中的旧离线快照，探测失败则保留旧离线状态。仍存在的同身份别名只释放新探测句柄，不创建重复条目。设备路径、探测退避键与全局接口认领均忽略大小写。
+`MonitorWorkSlot` 在超时后继续持有原任务；任何轮询、发现、恢复都不能并发复用该插件。完成的来源立即发布，不等全部插件。扫描未结束时只轮询已有设备，不用旧清单推断拔出。具体边界、同品牌阻塞限制见 `dev/stability-recovery.md` §10。
 
-### 2.1 快速发现（DiscoverOnlyAsync，每 15 秒）
+`BatteryPluginBase.AttachAsync` 先退役消失接口，等待旧 I/O/监听完成才释放认领；同一身份重连成功时，新状态替换返回列表中的旧离线快照。仍存在的同身份别名只释放新探测句柄，不创建重复条目。路径、退避键与接口认领均忽略大小写。
 
-`RequestDiscoveryAsync` 走**同一个闸门**，所以永远不会和主轮询并发；主轮询在跑时它直接返回那一轮。
+### 2.1 快速发现（RunPassAsync(Discovery)，每 15 秒）
 
-```
-DiscoverOnlyAsync
-├── HidDeviceScanner.Scan()
-└── Task.WhenAll(SupportsFastDiscovery || SupportsDiscoveryProbe 的启用插件 AttachAsync)
-       → 只认领，不 Poll；Upsert 仍在闸门线程
-```
+`RequestDiscoveryAsync` 在主轮观察尚未结束时复用主轮；其他时候只调度支持快速发现的插件，并与该插件轮询/恢复共享 slot。各插件完成即 Upsert；不轮询电量，不碰 BLE/经典蓝牙，不增加未经授权的发现查询。
 
 **并行粒度（2026-10-16）**：不同品牌各持自己的 HID 句柄，慢探测可重叠；同一句柄（含罗技多槽）仍排队。发现路径用 `ReadInputAsync`（雷柏/英菲克）或把同步 `Probe` 丢到线程池（迈从/北通默认），禁止用 `Parallel.For` 包阻塞的 `GetResult()`。
 
@@ -84,15 +78,17 @@ DiscoverOnlyAsync
 
 **发现**：`BluetoothLEDevice.GetDeviceSelector()` 建 DeviceWatcher，属性候选列表逐个试（本机只有 `System.Devices.Aep.IsConnected` 可用）。Added/Updated 回调 → HandleDevice → 组 DeviceStatus（含名称、连接态）→ DeviceUpdated → Manager.Upsert。
 
-**电量**：系统属性可靠时直接用；否则 `ReadBatteryViaGattAsync`——连接 → GetGattService(0x180F) → 读 characteristic(0x2A19) → 字节[0] 即百分比，8 秒超时，SemaphoreSlim 限流，每设备记录上次尝试时间避免频繁重试。
+**电量**：系统属性可靠时直接用；否则 `ReadBatteryViaGattAsync`——连接 → GetGattService(0x180F) → 读 characteristic(0x2A19) → 字节[0] 即百分比。整次补读在 24 秒后向 WinRT 请求取消，`SemaphoreSlim` 串行化，每设备仍限流 2 分钟；不在外层超时后启动另一个操作复用会话。请求取消不等于证明驱动已结束，真实驱动行为需另验。
 
 **离线**：IsConnected=false → 标记离线（保留最后电量显示）。
+
+**恢复与回写**：`WatcherRecovery` 统一负责两个 watcher 的启动、退避及停止屏障；`ConnectionEpochs` 保护 GATT 和经典蓝牙连接确认。断连、移除、监视器重建及退出都会废弃旧异步结果，缺少连接属性的更新沿用已知离线状态；修改和通知在同一锁内完成，通知及 `Snapshot` 返回副本。流程与验证边界见 [stability-recovery.md](../dev/stability-recovery.md)。
 
 **经典蓝牙（BluetoothClassicWatcher，2026-10-06 新增）**：`BluetoothLEDevice.GetDeviceSelector()` 只覆盖 BLE 端点（ProtocolId `{BB7BB05E-…}`），经典蓝牙音频设备（BR/EDR，ProtocolId `{E0CBF06C-…}`，如 EDIFIER W820NB）根本不进那个 watcher——这就是"蓝牙耳机已连接但列表没有"的根因。此 watcher 用 `BluetoothDevice.GetDeviceSelector()`（已配对经典设备）单开一路。**纯被动：不打开设备、零写入。** 两个修正 BLE 版的坑：Updated 只带变化属性，IsConnected 缺失时沿用现状不误判离线；Removed 发离线状态而非静默删除。已知取舍：所有已配对且已连接的经典蓝牙设备（含手机）都会显示。
 
 **设备类型不预设（2026-10-09 修）**：正因为"含鼠标/键盘/手机"，`Kind` 不能硬编码成 Headset——真机 RAPOO BT3.0 鼠标就是这么被显示成耳机的。类型改由 `Models/ClassicDeviceKindResolver` 按"Windows 设备类别 → 服务 UUID → 显示名"三级判定，名字/类别后到时重试，详见 dev/runtime-pitfalls.md §3.1。
 
-**经典蓝牙电量与类型信号（ClassicDevNodeReader，电量 2026-10-06 打通、类型信号 2026-10-09 并入）**：AEP 属性（`System.Devices.AepBattery_Level` 等）在本机全部无效，但 Windows 设置页显示的耳机电量另有来源——**HFP 免手操作音频网关设备节点的 PnP 属性 `DEVPKEY_Device_BatteryLevel`**（`{104EA319-6EE2-4701-BD47-8DDBF425BBE5},2`，BYTE）。`ClassicDevNodeReader` 用 SetupAPI（`SetupDiGetClassDevsW` → `SetupDiEnumDeviceInfo` → `SetupDiGetDeviceInstanceIdW` → `SetupDiGetDevicePropertyW`）枚举 `BTHENUM\*` 节点，**按设备 MAC 归并**出三样东西：电量（HFP 网关节点）、Windows 设备类别（父节点 `DEVPKEY_DeviceDisplay_Category`）、服务 UUID（子节点实例 ID 前缀）；watcher 侧用 `MacFromAepId`（AEP ID 形如 `Bluetooth#Bluetooth<适配器MAC>-<设备MAC>`，取最后一段）对上号。整表结果缓存 5 秒；`RefreshBattery()` 挂在轮询尾部（`PollOnceAsync` 的 `_classic.RefreshBattery()`）每分钟重读，有变化才通知。实测 EDIFIER W820NB 读数与设置页一致。排查手法见 scripts/probe-devnode-battery.py、scripts/probe-classic-kind.py。
+**经典蓝牙电量与类型信号（ClassicDevNodeReader，电量 2026-10-06 打通、类型信号 2026-10-09 并入）**：AEP 属性（`System.Devices.AepBattery_Level` 等）在本机全部无效，但 Windows 设置页显示的耳机电量另有来源——**HFP 免手操作音频网关设备节点的 PnP 属性 `DEVPKEY_Device_BatteryLevel`**（`{104EA319-6EE2-4701-BD47-8DDBF425BBE5},2`，BYTE）。`ClassicDevNodeReader` 用 SetupAPI（`SetupDiGetClassDevsW` → `SetupDiEnumDeviceInfo` → `SetupDiGetDeviceInstanceIdW` → `SetupDiGetDevicePropertyW`）枚举 `BTHENUM\*` 节点，**按设备 MAC 归并**出三样东西：电量（HFP 网关节点）、Windows 设备类别（父节点 `DEVPKEY_DeviceDisplay_Category`）、服务 UUID（子节点实例 ID 前缀）；watcher 侧用 `MacFromAepId`（AEP ID 形如 `Bluetooth#Bluetooth<适配器MAC>-<设备MAC>`，取最后一段）对上号。整表结果缓存 5 秒；`RefreshBattery()` 挂在轮询尾部（`RunPassAsync` 的经典蓝牙 slot）每分钟重读，有变化才通知。实测 EDIFIER W820NB 读数与设置页一致。排查手法见 scripts/probe-devnode-battery.py、scripts/probe-classic-kind.py。
 
 ## 3.1 本机电量流（SystemBatteryWatcher，2026-10-08 新增）
 
@@ -101,7 +97,7 @@ DiscoverOnlyAsync
 ```
 DeviceManager 构造 → _system.DeviceUpdated += Upsert
 DeviceManager.Start() → if (Settings.MonitorSystemBattery) _system.Start()
-PollOnceAsync 尾部 → if (Settings.MonitorSystemBattery) _system.Refresh()
+RunPassAsync 的系统电池 slot → if (Settings.MonitorSystemBattery) _system.Refresh()
                       （与 _classic.RefreshBattery() 并排，每分钟一次）
 ```
 
@@ -164,7 +160,7 @@ BatteryPluginBase.Attach(hidDevices, claims)
 现在三个位置各只记第一次——"这条通道不是 QHW"、"未授权写入"、"keyboard-v1 两次询问无响应"，
 恢复正常时 `Log.ResetOnce` 清标记，于是"好了之后又出问题"会重新记一条（与北通占位帧同一记法）。
 
-`AttachAsync` 先释放扫描中已消失或请求重认领的接口；返回移除设备的离线快照，供 DeviceManager 更新独立副本。若同一轮已由新路径认领相同稳定 ID，就只返回新状态，避免旧离线快照覆盖新在线状态。候选路径按 Windows 大小写不敏感去重；同一物理 ID 的重复探测句柄也会立即释放。Haute 用芯片标识生成稳定 ID，其他插件沿用原 ID 规则。
+`AttachAsync` 先退役扫描中已消失或请求重认领的接口；返回移除设备的离线快照，供 DeviceManager 更新独立副本。只有句柄 I/O 与旧监听全部结束才释放认领、重探，失败探测和重复身份句柄也如此。若同一轮已认领相同稳定 ID，就只返回新状态，避免旧离线快照覆盖新在线状态。候选路径按 Windows 大小写不敏感去重；Haute 用芯片标识生成稳定 ID，其他插件沿用原 ID 规则。恢复授权、冷却与旧任务隔离契约见 `dev/stability-recovery.md` §7。
 
 ### 4.2 轮询（Poll，基类骨架 + 子类 PollDevice）
 
@@ -215,7 +211,11 @@ WriteOutput：异步 WriteFile（500ms 超时，失败记 Win32 错误码）。�
 调用方此时会自己记一条更精确的 INFO。**别用它掩盖真正的写入故障。**
 ReadInput：**单悬空读**——句柄生命周期只有一个挂着的 ReadAsync，超时让它继续挂着，下次复用（runtime-pitfalls §1，改坏这条所有协议集体失灵）。
 
+`ReadInputResultAsync` 提供错误类别，旧读写入口保持兼容；Win32 6/1167 等明确失效使句柄停止接受新 I/O，普通超时与访问冲突不触发重开。读写超时后仍登记底层在途操作，`Drained` 只在它们与关闭操作结束后完成；旧写未完成时不再启动第二份输出。恢复/解锁/HID 插拔通过 `RecoveryScheduler` 合并后进入原管理器串行闸门，细节见 `dev/stability-recovery.md` §7–§9，CR-72 全局阻塞仍未处理。
+
 ## 5. 状态汇聚与历史（DeviceManager.Upsert / SafeSample）
+
+管理器存储独立快照，旧快照不能覆盖较晚状态；成功电量观察、连接证据、状态变化分别计时。历史只记录当前连接有效且未过期的新电量观察，不重复采样缓存，原有历史保留；细节见 `dev/stability-recovery.md` §11。
 
 ```
 Upsert(incoming):
@@ -272,3 +272,5 @@ Initialize：RegisterClassW 建隐藏消息窗口（类名带 GUID）→ Shell_N
 ## 10. 退出流
 
 托盘、贴片或小组件的退出，以及无后台入口时关闭主窗口，均走 `TrayService.ExitApplication`：删托盘图标 → `AppServices.Dispose` 释放组件、设备管理器和历史库 → 释放互斥量/日志 → `Environment.Exit(0)`。
+
+设备管理器先拒绝新轮次/上报、停止恢复调度并关闭已登记的基类插件句柄，再等当前轮次结束后清理插件字典。句柄及监听未收尾时认领仍保留，不与新会话重叠；现有立即结束进程的入口不等于所有不可返回的原生调用都已经完成，验证边界见 `dev/stability-recovery.md` §8。

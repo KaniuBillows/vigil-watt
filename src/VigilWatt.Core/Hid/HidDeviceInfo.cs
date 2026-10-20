@@ -1,6 +1,5 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
 
 namespace VigilWatt.Core.Hid;
 
@@ -45,161 +44,22 @@ public sealed class HidDeviceInfo
             NativeHid.FILE_FLAG_OVERLAPPED,
             IntPtr.Zero);
 
-        int hr = handle.IsInvalid ? Marshal.GetHRForLastWin32Error() : 0;
+        int error = handle.IsInvalid ? Marshal.GetLastWin32Error() : 0;
         if (handle.IsInvalid)
         {
-            throw hr switch
+            handle.Dispose();
+            throw error switch
             {
-                unchecked((int)0x80070005) => new UnauthorizedAccessException($"无权访问 {DevicePath}（系统保护 collection）"),
-                _ => new Win32Exception(hr, $"打开 HID 设备失败: {DevicePath}"),
+                5 => new UnauthorizedAccessException($"无权访问 {DevicePath}（系统保护 collection）"),
+                _ => new Win32Exception(error, $"打开 HID 设备失败: {DevicePath}"),
             };
         }
 
-        var stream = new FileStream(handle, FileAccess.ReadWrite, 0, isAsync: true);
-        return new HidDeviceHandle(this, stream);
-    }
-}
-
-/// <summary>已打开的 HID 设备句柄，封装 feature/input/output 报文读写。</summary>
-public sealed class HidDeviceHandle : IDisposable
-{
-    private readonly FileStream _stream;
-
-    public HidDeviceInfo Info { get; }
-
-    internal HidDeviceHandle(HidDeviceInfo info, FileStream stream)
-    {
-        Info = info;
-        _stream = stream;
-    }
-
-    /// <summary>读取 Feature Report；reportLength 可指定单个报文长度，默认用接口最大长度，返回值含 report ID。</summary>
-    public byte[]? GetFeature(byte reportId, int? reportLength = null)
-        => GetFeature(reportId, out _, reportLength);
-
-    public byte[]? GetFeature(byte reportId, out int error, int? reportLength = null)
-    {
-        error = 0;
-        int len = reportLength ?? Info.FeatureReportLength;
-        if (len == 0) return null;
-        if (len < 1 || len > Info.FeatureReportLength) throw new ArgumentOutOfRangeException(nameof(reportLength));
-        var buffer = new byte[len];
-        buffer[0] = reportId;
-        if (!NativeHid.HidD_GetFeature(_stream.SafeFileHandle, buffer, (uint)len))
-        {
-            error = Marshal.GetLastWin32Error();
-            return null;
-        }
-        return buffer;
-    }
-
-    /// <summary>
-    /// 读该接口**输出报文**的 report ID（由 caps 的 ReportID 字段给出）。0 = 该接口不使用 report ID；读不到返回 null。
-    /// **绝不能硬编码**（北通 T9 三个厂商集合 1/4/5、鲲鹏20 是 2）：写一个该接口没有的 report ID，驱动直接报 ERROR_INVALID_FUNCTION。
-    /// 用户态拿不到原始报告描述符（hid.dll 不导出 HidP_GetReportDescriptor），故走 caps。详见 docs/hardware/protocols.md §4.3。
-    /// </summary>
-    public byte? GetOutputReportId()
-    {
-        if (!NativeHid.HidD_GetPreparsedData(_stream.SafeFileHandle, out var preparsed)) return null;
         try
         {
-            // 输出集合优先；个别接口的输出集合没有 caps（纯 padding），退回输入集合——
-            // Report ID 是 HID 全局项，同一接口的各报文类型共用同一组 ID。
-            var id = NativeHid.ReadReportId(preparsed, NativeHid.HIDP_REPORT_TYPE.HidP_Output);
-            id ??= NativeHid.ReadReportId(preparsed, NativeHid.HIDP_REPORT_TYPE.HidP_Input);
-            return id;
+            var stream = new FileStream(handle, FileAccess.ReadWrite, 0, isAsync: true);
+            return new HidDeviceHandle(this, stream);
         }
-        catch
-        {
-            return null;
-        }
-        finally
-        {
-            NativeHid.HidD_FreePreparsedData(preparsed);
-        }
-    }
-
-    /// <summary>发送 Feature Report；reportLength 包含 report ID，默认用接口最大长度。</summary>
-    public bool SetFeature(byte reportId, byte[] payload, int? reportLength = null)
-    {
-        int len = reportLength ?? Info.FeatureReportLength;
-        if (len == 0) return false;
-        if (len < 1 || len > Info.FeatureReportLength) throw new ArgumentOutOfRangeException(nameof(reportLength));
-        var buffer = new byte[len];
-        buffer[0] = reportId;
-        Array.Copy(payload, 0, buffer, 1, Math.Min(payload.Length, len - 1));
-        return NativeHid.HidD_SetFeature(_stream.SafeFileHandle, buffer, (uint)len);
-    }
-
-    /// <summary>
-    /// 写 output report（WriteFile，异步带超时）。buffer[0] 是 report ID。
-    /// <paramref name="quiet"/> = true 时不把失败记成 WARN——调用方已知该失败是**预期结果**（如探测不属于本协议的通道，写失败正是"不是这条通道"的判据）。
-    /// **别用它掩盖真正的写入故障。**
-    /// </summary>
-    public bool WriteOutput(byte[] report, TimeSpan timeout, bool quiet = false)
-    {
-        try
-        {
-            var writeTask = _stream.WriteAsync(report, 0, report.Length);
-            writeTask.Wait(timeout);
-            if (!writeTask.IsCompletedSuccessfully)
-            {
-                int err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-                if (!quiet) Utils.Log.Warn($"WriteOutput 失败 len={report.Length} lastWin32Err={err}");
-                return false;
-            }
-            return true;
-        }
-        catch (Exception ex)
-        {
-            if (!quiet) Utils.Log.Warn($"WriteOutput 异常 len={report.Length}: {ex.Message}");
-            return false;
-        }
-    }
-
-    // 单悬空读：超时后旧 ReadAsync 仍挂在驱动队列上（无法取消），重复开新读会导致
-    // 设备响应被旧读吃掉。整个句柄生命周期只保留一个 pending read，数据来了在下次调用时取走。
-    private Task<int>? _pendingRead;
-    private byte[] _readBuffer = Array.Empty<byte>();
-
-    /// <summary>读一个 input report（阻塞等待）。发现路径请用 <see cref="ReadInputAsync"/>，避免堵死线程池。</summary>
-    public byte[]? ReadInput(TimeSpan timeout)
-        => ReadInputAsync(timeout).GetAwaiter().GetResult();
-
-    /// <summary>读一个 input report（可等待）。超时后旧读继续挂着，下次调用再取走。</summary>
-    public async Task<byte[]?> ReadInputAsync(TimeSpan timeout)
-    {
-        ushort len = Info.InputReportLength;
-        if (len == 0) return null;
-        try
-        {
-            if (_pendingRead == null)
-            {
-                _readBuffer = new byte[len];
-                _pendingRead = _stream.ReadAsync(_readBuffer, 0, len);
-            }
-            var completed = await Task.WhenAny(_pendingRead, Task.Delay(timeout)).ConfigureAwait(false);
-            if (completed != _pendingRead)
-                return null;
-            int n = await _pendingRead.ConfigureAwait(false);
-            _pendingRead = null;
-            if (n <= 0) return null;
-            var result = new byte[n];
-            Array.Copy(_readBuffer, result, n);
-            return result;
-        }
-        catch (Exception ex)
-        {
-            // 读失败多半是设备拔出/句柄失效（预期），记 Debug 即可（CR-21）。
-            if (Utils.Log.IsEnabled(Utils.LogLevel.Debug))
-                Utils.Log.Debug($"ReadInput 失败: {ex.Message}");
-            _pendingRead = null;
-            return null;
-        }
-    }
-
-    public void Dispose()
-    {
-        _stream.Dispose();
+        catch { handle.Dispose(); throw; }
     }
 }

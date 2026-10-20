@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using VigilWatt.Core.Models;
 using VigilWatt.Core.Utils;
 using Windows.Devices.Bluetooth;
@@ -14,11 +13,15 @@ namespace VigilWatt.Core.Ble;
 /// </summary>
 public sealed class BleBatteryWatcher : IDisposable
 {
-    private DeviceWatcher? _watcher;
-    private bool _started;
-    private readonly ConcurrentDictionary<string, DeviceStatus> _devices = new();
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _lastGattAttempt = new();
+    private readonly WatcherRecovery _recovery;
+    private readonly ConnectionEpochs _connections;
+    private readonly Dictionary<string, DeviceStatus> _devices = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _lastGattAttempt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _activeGatt = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _gattGate = new(1, 1);
+    private readonly CancellationTokenSource _shutdown = new();
+    private bool _disposed, _gattResourcesDisposed;
+    private int _pendingGatt;
 
     public event Action<DeviceStatus>? DeviceUpdated;
 
@@ -32,11 +35,22 @@ public sealed class BleBatteryWatcher : IDisposable
 
     private string? _batteryProp;
 
-    public void Start()
+    public BleBatteryWatcher()
     {
-        if (_started) return;
-        _started = true;
+        _recovery = new WatcherRecovery("BLE", CreateSession, InvalidateConnections);
+        _connections = new ConnectionEpochs(_recovery.SyncRoot);
+    }
 
+    public void Start() => _recovery.Start();
+
+    private void InvalidateConnections()
+    {
+        _connections.Clear();
+        _lastGattAttempt.Clear();
+    }
+
+    private IWatcherSession CreateSession()
+    {
         var selector = BluetoothLEDevice.GetDeviceSelector();
         DeviceWatcher? watcher = null;
         foreach (var props in BatteryPropCandidates)
@@ -44,7 +58,7 @@ public sealed class BleBatteryWatcher : IDisposable
             try
             {
                 watcher = DeviceInformation.CreateWatcher(selector, props, DeviceInformationKind.AssociationEndpoint);
-                if (props.Length == 3) _batteryProp = props[1];
+                _batteryProp = props.Length == 3 ? props[1] : null;
                 Log.Info($"BLE watcher 属性集可用: {string.Join(", ", props)}");
                 break;
             }
@@ -54,18 +68,10 @@ public sealed class BleBatteryWatcher : IDisposable
                 watcher = null;
             }
         }
-        if (watcher == null)
-        {
-            Log.Error("BLE DeviceWatcher 无法创建，BLE 监控不可用");
-            return;
-        }
-
-        watcher.Added += (w, info) => HandleDevice(info.Id, info.Properties, info.Name);
-        watcher.Updated += (w, update) => HandleDevice(update.Id, update.Properties, null);
-        watcher.Removed += (w, update) => HandleRemoved(update.Id);
-        watcher.Start();
-        _watcher = watcher;
-        Log.Info("BLE DeviceWatcher 已启动");
+        if (watcher == null) throw new InvalidOperationException("BLE DeviceWatcher 无可用属性集");
+        return new WinRtWatcherSession(watcher,
+            (session, id, props, name) => _recovery.RunIfCurrent(session, () => HandleDevice(id, props, name)),
+            (session, id) => _recovery.RunIfCurrent(session, () => HandleRemoved(id)));
     }
 
     private void HandleDevice(string id, IReadOnlyDictionary<string, object> props, string? name)
@@ -73,6 +79,8 @@ public sealed class BleBatteryWatcher : IDisposable
         // Updated 只带变化的属性：IsConnected 缺失时必须沿用现状，不能默认 false
         // （真机 2026-10-08：戴尔 WK717 已连接却被后续 Updated 误判离线，与经典蓝牙同坑）
         bool? connected = WatcherProps.ReadConnected(props);
+        long epoch = _connections.Observe(id, connected ??
+            (_devices.TryGetValue(id, out var prior) && !prior.IsOnline ? (bool?)false : null));
 
         int? percent = WatcherProps.ReadBattery(props, _batteryProp);
 
@@ -81,25 +89,30 @@ public sealed class BleBatteryWatcher : IDisposable
             if (_devices.TryGetValue(id, out var tracked) && tracked.IsOnline)
             {
                 tracked.IsOnline = false;
+                tracked.ReadingConnectionConfirmed = false;
                 tracked.LastUpdated = DateTimeOffset.Now;
+                tracked.ConnectionObservedAt = tracked.LastUpdated;
                 Log.Info($"BLE 设备离线: {tracked.DisplayName}");
-                DeviceUpdated?.Invoke(tracked);
+                DeviceUpdated?.Invoke(tracked.Clone());
             }
+            _lastGattAttempt.Remove(id);
             return;
         }
+        if (!_connections.IsCurrent(id, epoch)) return;
 
         // 未跟踪过、且本次既无电量也未明确在线 → 邻居设备，忽略
         bool known = _devices.ContainsKey(id);
         if (!known && percent == null && connected != true)
             return;
 
-        var status = _devices.GetOrAdd(id, _ => new DeviceStatus
+        if (!_devices.TryGetValue(id, out var status))
         {
-            Id = $"ble:{id}",
-            Name = name ?? "",
-            Source = DeviceSource.Ble,
-            Protocol = "BLE GATT",
-        });
+            status = new DeviceStatus
+            {
+                Id = $"ble:{id}", Name = name ?? "", Source = DeviceSource.Ble, Protocol = "BLE GATT",
+            };
+            _devices[id] = status;
+        }
         ApplyName(status, name, props);
         if (status.Kind == DeviceKind.Unknown)
             status.Kind = DeviceKindGuesser.Guess(status.Name);
@@ -107,37 +120,38 @@ public sealed class BleBatteryWatcher : IDisposable
         // 明确在线，或读到电量，或本来就在列表里且本次未说断开 → 保持/标为在线
         bool wasOffline = !status.IsOnline;
         status.IsOnline = true;
+        status.ConnectionObservedAt = DateTimeOffset.Now;
         status.LastUpdated = DateTimeOffset.Now;
 
         if (percent.HasValue)
         {
-            bool batteryChanged = status.BatteryPercent != percent;
+            _connections.Remove(id);
+            _connections.Observe(id, connected);
             status.BatteryPercent = percent;
-            if (wasOffline || batteryChanged || !known)
-                DeviceUpdated?.Invoke(status);
+            status.ObserveBattery(DateTimeOffset.Now);
+            DeviceUpdated?.Invoke(status.Clone());
             return;
         }
 
         if (wasOffline || !known)
-            DeviceUpdated?.Invoke(status);
+            DeviceUpdated?.Invoke(status.Clone());
 
         // 系统没给电量：主动 GATT 读一次（限流 2 分钟）
-        if (!_lastGattAttempt.TryGetValue(id, out var last) ||
-            DateTimeOffset.Now - last > TimeSpan.FromMinutes(2))
-        {
-            _lastGattAttempt[id] = DateTimeOffset.Now;
-            _ = ReadBatteryViaGattAsync(id, status);
-        }
+        _ = QueueGattRead(id);
     }
 
     private void HandleRemoved(string id)
     {
-        if (_devices.TryRemove(id, out var tracked) && tracked.IsOnline)
+        _connections.Remove(id);
+        _lastGattAttempt.Remove(id);
+        if (_devices.Remove(id, out var tracked) && tracked.IsOnline)
         {
             tracked.IsOnline = false;
+            tracked.ReadingConnectionConfirmed = false;
             tracked.LastUpdated = DateTimeOffset.Now;
+            tracked.ConnectionObservedAt = tracked.LastUpdated;
             Log.Info($"BLE 设备移除: {tracked.DisplayName}");
-            DeviceUpdated?.Invoke(tracked);
+            DeviceUpdated?.Invoke(tracked.Clone());
         }
     }
 
@@ -156,50 +170,74 @@ public sealed class BleBatteryWatcher : IDisposable
         }
     }
 
-    private async Task ReadBatteryViaGattAsync(string aepId, DeviceStatus status)
+    private Task QueueGattRead(string id)
     {
-        await _gattGate.WaitAsync();
+        if (_disposed || !_recovery.IsRunning || !_devices.TryGetValue(id, out var status) || !status.IsOnline)
+            return Task.CompletedTask;
+        if (_lastGattAttempt.TryGetValue(id, out var last) && DateTimeOffset.Now - last <= TimeSpan.FromMinutes(2))
+            return Task.CompletedTask;
+        long epoch = _connections.Observe(id, null);
+        if (!_connections.IsCurrent(id, epoch)) return Task.CompletedTask;
+        if (!_activeGatt.Add(id)) return Task.CompletedTask;
+        _lastGattAttempt[id] = DateTimeOffset.Now;
+        _pendingGatt++;
+        return ReadBatteryViaGattAsync(id, epoch);
+    }
+
+    private async Task ReadBatteryViaGattAsync(string aepId, long epoch)
+    {
+        bool entered = false;
         try
         {
-            var ble = await OpenDeviceAsync(aepId);
+            await _gattGate.WaitAsync(_shutdown.Token).ConfigureAwait(false);
+            entered = true;
+            if (!_connections.IsCurrent(aepId, epoch)) return;
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(24));
+            var ble = await BluetoothLEDevice.FromIdAsync(aepId).AsTask(timeout.Token).ConfigureAwait(false);
             if (ble == null) return;
             using (ble)
             {
-                // FromIdAsync 成功且能读 GATT = 设备实际可达，纠正假离线
                 if (ble.ConnectionStatus != BluetoothConnectionStatus.Connected)
                     return;
 
                 var svcResult = await ble
                     .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
-                    .AsTask().WaitAsync(TimeSpan.FromSeconds(8));
-                if (svcResult.Status != GattCommunicationStatus.Success || svcResult.Services.Count == 0) return;
-
-                var chrResult = await svcResult.Services[0]
-                    .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Uncached)
-                    .AsTask().WaitAsync(TimeSpan.FromSeconds(8));
-                if (chrResult.Status != GattCommunicationStatus.Success || chrResult.Characteristics.Count == 0) return;
-
-                var read = await chrResult.Characteristics[0]
-                    .ReadValueAsync(BluetoothCacheMode.Uncached)
-                    .AsTask().WaitAsync(TimeSpan.FromSeconds(8));
-                if (read.Status != GattCommunicationStatus.Success) return;
-
-                var reader = DataReader.FromBuffer(read.Value);
-                int percent = reader.ReadByte();
-                if (percent is > 0 and <= 100)
+                    .AsTask(timeout.Token).ConfigureAwait(false);
+                try
                 {
-                    bool wasOffline = !status.IsOnline;
-                    status.IsOnline = true;
-                    status.BatteryPercent = percent;
-                    status.LastUpdated = DateTimeOffset.Now;
-                    if (status.Kind == DeviceKind.Unknown)
-                        status.Kind = DeviceKindGuesser.Guess(status.Name);
-                    DeviceUpdated?.Invoke(status);
-                    Log.Info(wasOffline
-                        ? $"BLE GATT 直读(恢复在线): {status.DisplayName} {percent}%"
-                        : $"BLE GATT 直读: {status.DisplayName} {percent}%");
+                    if (svcResult.Status != GattCommunicationStatus.Success || svcResult.Services.Count == 0) return;
+                    if (!_connections.IsCurrent(aepId, epoch)) return;
+                    var chrResult = await svcResult.Services[0]
+                        .GetCharacteristicsForUuidAsync(GattCharacteristicUuids.BatteryLevel, BluetoothCacheMode.Uncached)
+                        .AsTask(timeout.Token).ConfigureAwait(false);
+                    if (chrResult.Status != GattCommunicationStatus.Success || chrResult.Characteristics.Count == 0) return;
+
+                    var read = await chrResult.Characteristics[0].ReadValueAsync(BluetoothCacheMode.Uncached)
+                        .AsTask(timeout.Token).ConfigureAwait(false);
+                    if (read.Status != GattCommunicationStatus.Success || read.Value.Length == 0) return;
+                    using var reader = DataReader.FromBuffer(read.Value);
+                    int percent = reader.ReadByte();
+                    if (percent is > 0 and <= 100)
+                        _connections.TryCommit(aepId, epoch, () =>
+                        {
+                            if (_disposed || !_devices.TryGetValue(aepId, out var status)) return;
+                            status.BatteryPercent = percent;
+                            status.ObserveBattery(DateTimeOffset.Now);
+                            status.LastUpdated = DateTimeOffset.Now;
+                            DeviceUpdated?.Invoke(status.Clone());
+                            Log.Info($"BLE GATT 直读: {status.DisplayName} {percent}%");
+                        });
+                }
+                finally
+                {
+                    foreach (var service in svcResult.Services) service.Dispose();
                 }
             }
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+            Log.Debug($"BLE GATT 退出取消: {aepId}");
         }
         catch (Exception ex)
         {
@@ -207,43 +245,51 @@ public sealed class BleBatteryWatcher : IDisposable
         }
         finally
         {
-            _gattGate.Release();
-        }
-    }
-
-    /// <summary>周期轮询已跟踪设备（含曾被误标离线的，便于自愈）。</summary>
-    public async Task PollConnectedAsync()
-    {
-        foreach (var (id, status) in _devices.ToArray())
-        {
-            if (!_lastGattAttempt.TryGetValue(id, out var last) ||
-                DateTimeOffset.Now - last > TimeSpan.FromMinutes(2))
+            if (entered) _gattGate.Release();
+            lock (_recovery.SyncRoot)
             {
-                _lastGattAttempt[id] = DateTimeOffset.Now;
-                await ReadBatteryViaGattAsync(id, status);
+                _activeGatt.Remove(aepId);
+                _pendingGatt--;
+                if (_disposed && _pendingGatt == 0) DisposeGattResources();
             }
         }
     }
 
-    private static async Task<BluetoothLEDevice?> OpenDeviceAsync(string aepId)
+    /// <summary>离线后等待新的连接证据，避免旧缓存读数重新覆盖断开状态。</summary>
+    public async Task PollConnectedAsync()
     {
-        try
+        string[] ids;
+        lock (_recovery.SyncRoot) ids = _devices.Keys.ToArray();
+        foreach (var id in ids)
         {
-            var task = BluetoothLEDevice.FromIdAsync(aepId).AsTask();
-            if (await Task.WhenAny(task, Task.Delay(8000)) != task) return null;
-            return task.Result;
-        }
-        catch
-        {
-            return null;
+            Task read;
+            lock (_recovery.SyncRoot) read = QueueGattRead(id);
+            await read.ConfigureAwait(false);
         }
     }
 
-    public IReadOnlyList<DeviceStatus> Snapshot() => _devices.Values.ToList();
+    public IReadOnlyList<DeviceStatus> Snapshot()
+    {
+        lock (_recovery.SyncRoot) return _devices.Values.Select(s => s.Clone()).ToList();
+    }
 
     public void Dispose()
     {
-        _watcher?.Stop();
+        lock (_recovery.SyncRoot)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _recovery.Dispose();
+            _shutdown.Cancel();
+            if (_pendingGatt == 0) DisposeGattResources();
+        }
+    }
+
+    private void DisposeGattResources()
+    {
+        if (_gattResourcesDisposed) return;
+        _gattResourcesDisposed = true;
         _gattGate.Dispose();
+        _shutdown.Dispose();
     }
 }

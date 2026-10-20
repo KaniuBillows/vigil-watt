@@ -1,3 +1,4 @@
+using VigilWatt.Core.Devices;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
@@ -24,6 +25,7 @@ public sealed class TrayService : IDisposable
     private bool _iconAdded;
     private IntPtr _currentHIcon;
     private uint _taskbarCreatedMessage;
+    private SystemRecoveryNotifications? _recoveryNotifications;
     /// <summary>刷新请求是否已排队（1 = 已排）。设备事件每轮会连打好几次，靠它合并成一次。</summary>
     private int _updateQueued;
 
@@ -101,6 +103,7 @@ public sealed class TrayService : IDisposable
         Log.Info($"托盘消息窗口 hwnd=0x{_hwnd:X} class={className}");
 
         _taskbarCreatedMessage = Native.RegisterWindowMessageW("TaskbarCreated");
+        _recoveryNotifications = new SystemRecoveryNotifications(_hwnd, _services.Manager.RequestRecovery);
     }
 
     private static IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
@@ -108,6 +111,8 @@ public sealed class TrayService : IDisposable
         var self = _instance;
         if (self != null)
         {
+            if (self._recoveryNotifications?.HandleMessage(msg, wParam, lParam) == true)
+                return msg == 0x0218 ? new IntPtr(1) : IntPtr.Zero;
             if (msg == CallbackMessage)
             {
                 self.HandleTrayMessage((uint)lParam);
@@ -145,7 +150,7 @@ public sealed class TrayService : IDisposable
         DeviceStatus? lowest = null;
         foreach (var d in _services.Manager.Devices)
         {
-            if (!d.IsOnline || d.BatteryPercent is not { } p) continue;
+            if (!ReadingFreshness.IsFresh(d, DateTimeOffset.UtcNow) || d.BatteryPercent is not { } p) continue;
             // 本机电量不参与托盘的"最低电量"取值（用户 2026-10-06 明确）：笔记本正常用到 30% 是常态，
             // 让它把托盘染红会盖掉"外设快没电了"这个真正的信号。它仍进设备列表/小组件/历史统计。
             if (d.Source == DeviceSource.System) continue;
@@ -256,7 +261,8 @@ public sealed class TrayService : IDisposable
                 deviceIndex++;
                 var text = d.IsOnline
                     ? $"{d.DisplayName}　{DeviceStatusFormatter.PercentText(d.BatteryPercent, "?")}" +
-                      (DeviceStatusFormatter.IsCharging(d.Charging) ? " ⚡" : "")
+                      (ReadingFreshness.IsStale(d, DateTimeOffset.UtcNow) ? " · 读数已过期 / Reading stale"
+                          : DeviceStatusFormatter.IsCharging(d.Charging) ? " ⚡" : "")
                     : $"{d.DisplayName}　离线";
                 Native.AppendMenuW(menu, Native.MF_STRING | Native.MF_GRAYED,
                     (IntPtr)(IdDeviceBase + deviceIndex), text);
@@ -384,7 +390,11 @@ public sealed class TrayService : IDisposable
     }
 
     public void Dispose()
-        => RemoveIcon();
+    {
+        _recoveryNotifications?.Dispose();
+        _recoveryNotifications = null;
+        RemoveIcon();
+    }
 
     private void RemoveIcon()
     {
