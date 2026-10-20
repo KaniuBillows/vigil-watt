@@ -170,8 +170,8 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     /// <summary>打开设备句柄：测试用覆写注入假句柄，生产路径走 <see cref="HidDeviceInfo.Open"/>。</summary>
     protected virtual HidDeviceHandle OpenDevice(HidDeviceInfo info) => info.Open();
 
-    private readonly Dictionary<string, TrackedDevice> _devices = new();   // key = DevicePath
-    private readonly Dictionary<string, DateTimeOffset> _probeFailedAt = new();
+    private readonly Dictionary<string, TrackedDevice> _devices = new(StringComparer.OrdinalIgnoreCase);   // key = DevicePath
+    private readonly Dictionary<string, DateTimeOffset> _probeFailedAt = new(StringComparer.OrdinalIgnoreCase);
     private DeviceClaimRegistry _claims = null!;
 
     public async Task<IReadOnlyList<DeviceStatus>> AttachAsync(
@@ -179,12 +179,30 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     {
         _claims = claims;
         var claimed = new List<DeviceStatus>();
+        var availablePaths = availableDevices.Select(d => d.DevicePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // 先释放消失的接口，否则旧身份会把同轮重连的新接口当成重复设备。
+        foreach (var path in _devices.Keys.ToList())
+        {
+            if (availablePaths.Contains(path)) continue;
+            if (_devices.Remove(path, out var gone))
+            {
+                StopPassiveListen(gone);
+                gone.Handle.Dispose();
+                gone.Status.IsOnline = false;
+                gone.Status.LastUpdated = DateTimeOffset.Now;
+                _claims.Release(path, Name);
+                Log.Info($"{DisplayName} 设备已移除: {path}");
+                claimed.Add(gone.Status);
+            }
+        }
 
         // 第一遍（快）：已有设备直接返回；筛出本轮需要新探测的接口（冷却中/被他人认领的跳过）
         var toProbe = new List<HidDeviceInfo>();
+        var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var info in availableDevices)
         {
-            if (!IsCandidate(info)) continue;
+            if (!seenPaths.Add(info.DevicePath) || !IsCandidate(info)) continue;
 
             if (_devices.TryGetValue(info.DevicePath, out var known) && !known.NeedsReprobe)
             {
@@ -198,6 +216,9 @@ public abstract class BatteryPluginBase : IBatteryPlugin
             {
                 StopPassiveListen(stale);
                 stale.Handle.Dispose();
+                stale.Status.IsOnline = false;
+                stale.Status.LastUpdated = DateTimeOffset.Now;
+                claimed.Add(stale.Status);
                 _claims?.Release(info.DevicePath, Name);
             }
 
@@ -217,22 +238,6 @@ public abstract class BatteryPluginBase : IBatteryPlugin
             for (int i = 0; i < toProbe.Count; i++)
                 outcomes[i] = await RunProbeAsync(toProbe[i]).ConfigureAwait(false);
             CommitProbes(outcomes, claimed);
-        }
-
-        // 已拔出的设备
-        foreach (var path in _devices.Keys.ToList())
-        {
-            if (availableDevices.Any(d => d.DevicePath == path)) continue;
-            if (_devices.Remove(path, out var gone))
-            {
-                StopPassiveListen(gone);
-                gone.Handle.Dispose();
-                gone.Status.IsOnline = false;
-                _claims?.Release(path, Name);
-                Log.Info($"{DisplayName} 设备已移除: {path}");
-                // DeviceManager 只收返回列表；不上报则拔出后条目永远在线。
-                claimed.Add(gone.Status);
-            }
         }
 
         return claimed;
@@ -287,6 +292,13 @@ public abstract class BatteryPluginBase : IBatteryPlugin
             }
 
             var (protocol, percent, charging) = probe;
+            // 同一物理设备的第二个接口（别名/同一 unit）已在别处认领：释放新句柄，不建重复条目。
+            if (_devices.Values.Any(existing => existing.Status.Id == o.DeviceId))
+            {
+                o.Handle!.Dispose();
+                _claims.Release(o.Info.DevicePath, Name);
+                continue;
+            }
             var status = new DeviceStatus
             {
                 Id = o.DeviceId!,
@@ -310,6 +322,8 @@ public abstract class BatteryPluginBase : IBatteryPlugin
             if (SupportsPassiveListen)
                 StartPassiveListen(dev);
             Log.Info($"认领{DisplayName}设备: {o.Info} proto={protocol} 电量={percent} 充电={charging}");
+            // 同一身份已接回时不能再向列表发送旧接口的离线状态。
+            claimed.RemoveAll(existing => existing.Id == status.Id);
             claimed.Add(status);
         }
     }

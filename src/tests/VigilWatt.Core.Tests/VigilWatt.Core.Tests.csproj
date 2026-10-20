@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
     <RootNamespace>VigilWatt.Core.Tests</RootNamespace>
+    <RunSettingsFilePath Condition="'$(OS)' == 'Windows_NT' and '$(RunSettingsFilePath)' == '' and Exists('$(ProgramFiles)\dotnet\dotnet.exe')">$(MSBuildThisFileDirectory)vstest.runsettings</RunSettingsFilePath>
   </PropertyGroup>
 
   <ItemGroup>

@@ -66,6 +66,23 @@ public class PluginReconnectTests : IDisposable
     }
 
     [Fact]
+    public async Task SameReceiverReprobeReturnsOnlyOnlineReplacement()
+    {
+        using var plugin = new FakePlugin();
+        var claims = new DeviceClaimRegistry();
+        var initial = Assert.Single(await plugin.AttachAsync([Info("same")], claims));
+        plugin.IdentityChanged = true;
+        plugin.Poll();
+        plugin.Poll();
+        var replacement = Assert.Single(await plugin.AttachAsync([Info("same")], claims));
+        Assert.Equal(initial.Id, replacement.Id);
+        Assert.True(replacement.IsOnline);
+        Assert.True(claims.IsClaimedBy("same", plugin.Name));
+        Assert.Equal(2, plugin.Streams.Count);
+        Assert.True(plugin.Streams[0].SafeFileHandle.IsClosed);
+    }
+
+    [Fact]
     public async Task EqualNamesWithDifferentPhysicalIdsRemainSeparate()
     {
         using var plugin = new FakePlugin();
@@ -112,6 +129,10 @@ public class PluginReconnectTests : IDisposable
         var second = Assert.Single(await plugin.AttachAsync([Info("hid#a")], claims));
         Assert.Same(first, second);
         Assert.Single(plugin.Streams);
+        Assert.False(claims.TryClaim("hid#a", "Other"));
+        Assert.False(Assert.Single(await plugin.AttachAsync([], claims)).IsOnline);
+        Assert.False(claims.IsClaimedBy("HID#A", plugin.Name));
+        Assert.True(claims.TryClaim("hid#a", "Other"));
     }
 
     [Fact]

@@ -31,6 +31,8 @@ PollOnceAsync
 └── DevicesChanged?.Invoke()
 ```
 
+`BatteryPluginBase.AttachAsync` 先释放本轮已消失接口的监听、句柄与认领，再探测新接口；同一身份重连成功时，新状态替换返回列表中的旧离线快照，探测失败则保留旧离线状态。仍存在的同身份别名只释放新探测句柄，不创建重复条目。设备路径、探测退避键与全局接口认领均忽略大小写。
+
 ### 2.1 快速发现（DiscoverOnlyAsync，每 15 秒）
 
 `RequestDiscoveryAsync` 走**同一个闸门**，所以永远不会和主轮询并发；主轮询在跑时它直接返回那一轮。

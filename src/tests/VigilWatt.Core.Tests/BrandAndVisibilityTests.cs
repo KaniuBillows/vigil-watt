@@ -17,20 +17,23 @@ public class BrandAndVisibilityTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void MigrationPreservesBrandPermissionAndRemovesModelToggle(bool brandEnabled)
+    public void MigrationPreservesBrandPermissionsAndRemovesObsoleteToggles(bool brandEnabled)
     {
         var settings = new AppSettings
         {
-            PluginEnabled = new() { ["Mchose"] = brandEnabled, ["MchoseMouse"] = true, ["Other"] = true }
+            PluginEnabled = new() { ["Mchose"] = brandEnabled, ["Rapoo"] = false, ["MchoseMouse"] = true, ["Other"] = true }
         };
         settings.NormalizePluginSettings();
         Assert.Equal(brandEnabled, settings.PluginEnabled["Mchose"]);
         Assert.False(settings.PluginEnabled.ContainsKey("MchoseMouse"));
-        Assert.True(settings.PluginEnabled["Other"]);
+        Assert.False(settings.PluginEnabled.ContainsKey("Other"));
+        Assert.False(settings.PluginEnabled["Rapoo"]);
         Assert.False(settings.PluginEnabled["Cherry"]);
         Assert.False(settings.PluginEnabled["Razer"]);
         settings.NormalizePluginSettings();
         Assert.Equal(brandEnabled, settings.PluginEnabled["Mchose"]);
+        Assert.False(settings.PluginEnabled["Rapoo"]);
+        Assert.False(settings.PluginEnabled.ContainsKey("Other"));
     }
 
     [Fact]
