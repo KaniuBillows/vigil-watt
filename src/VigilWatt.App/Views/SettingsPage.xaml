@@ -267,7 +267,7 @@
                             <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16" Padding="0,12">
                                 <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
                                     <TextBlock Text="任务栏电量贴片" Style="{StaticResource RowTitleStyle}" />
-                                    <TextBlock Text="在任务栏里（系统托盘左边）钉一条电量胶囊，按住可沿任务栏拖动；本机电量不参与（系统已有电池图标）"
+                                    <TextBlock Text="在任务栏左侧或通知区域左侧显示电量胶囊，可拖动微调；本机电量不参与（系统已有电池图标）"
                                                Style="{StaticResource RowDescStyle}" />
                                 </StackPanel>
                                 <ToggleSwitch Grid.Column="1" x:Name="TaskbarToggle"
@@ -296,6 +296,19 @@
                                           SelectionChanged="TaskbarMode_Changed">
                                     <ComboBoxItem Content="全部在线设备" Tag="All" />
                                     <ComboBoxItem Content="仅最低电量一台" Tag="Lowest" />
+                                </ComboBox>
+                            </Grid>
+                            <Border Style="{StaticResource RowDividerStyle}" />
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16" Padding="0,12">
+                                <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
+                                    <TextBlock Text="贴片位置" Style="{StaticResource RowTitleStyle}" />
+                                    <TextBlock x:Name="TaskbarPositionHintText" Style="{StaticResource RowDescStyle}" />
+                                </StackPanel>
+                                <ComboBox Grid.Column="1" x:Name="TaskbarPositionCombo" Width="180"
+                                          VerticalAlignment="Center"
+                                          SelectionChanged="TaskbarPosition_Changed">
+                                    <ComboBoxItem Content="靠左" Tag="Left" />
+                                    <ComboBoxItem Content="靠右" Tag="Right" />
                                 </ComboBox>
                             </Grid>
                             <Border Style="{StaticResource RowDividerStyle}" />

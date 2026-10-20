@@ -35,17 +35,16 @@ public static class TaskbarLayout
         return (int)Math.Ceiling(Math.Clamp(thicknessDip - marginDip * 2, minDip, maxDip) * scale);
     }
 
-    /// <summary>
-    /// 贴片左上角（物理像素）。默认位 = 紧贴托盘左边（竖向任务栏则是托盘上边），再叠加用户拖动出来的
-    /// <paramref name="offset"/>；结果夹在任务栏内，并把"实际落点"反推回 <paramref name="appliedOffset"/>——
-    /// 这样拖到头再往回拖不会有一段"空走"。
-    /// </summary>
+    /// <summary>反推夹紧后的偏移，避免拖到边缘后往回拖时空走；左右锚点见 docs/dev/runtime-pitfalls.md §16.5。</summary>
     public static (int X, int Y) Place(
-        PixelRect taskbar, PixelRect tray, int pillW, int pillH, int offset, int gapPx, out int appliedOffset)
+        PixelRect taskbar, PixelRect tray, int pillW, int pillH, int offset, int gapPx, out int appliedOffset,
+        string? position = null)
     {
+        bool left = TaskbarBatteryPosition.Normalize(position) == TaskbarBatteryPosition.Left;
         if (IsHorizontal(taskbar))
         {
-            int anchor = (tray.Width > 0 ? tray.Left : taskbar.Right) - pillW - gapPx;
+            int anchor = left ? taskbar.Left + gapPx
+                : (tray.Width > 0 ? tray.Left : taskbar.Right) - pillW - gapPx;
             int min = taskbar.Left + EdgeInsetPx;
             int max = Math.Max(min, taskbar.Right - pillW - EdgeInsetPx);
             int x = Math.Clamp(anchor + offset, min, max);
@@ -53,7 +52,8 @@ public static class TaskbarLayout
             return (x, taskbar.Top + (taskbar.Height - pillH) / 2);
         }
 
-        int anchorY = (tray.Height > 0 ? tray.Top : taskbar.Bottom) - pillH - gapPx;
+        int anchorY = left ? taskbar.Top + gapPx
+            : (tray.Height > 0 ? tray.Top : taskbar.Bottom) - pillH - gapPx;
         int minY = taskbar.Top + EdgeInsetPx;
         int maxY = Math.Max(minY, taskbar.Bottom - pillH - EdgeInsetPx);
         int y = Math.Clamp(anchorY + offset, minY, maxY);

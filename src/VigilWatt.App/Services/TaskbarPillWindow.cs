@@ -46,6 +46,7 @@ public sealed class TaskbarPillWindow : IDisposable
     private int _pillW, _pillH;
     private int _offsetPx;
     private int _offsetDpi;
+    private string _position = TaskbarBatteryPosition.Right;
     private uint _windowDpi;
     private bool _dragging;
     private int _dragStartCursor, _dragStartOffset;
@@ -83,8 +84,8 @@ public sealed class TaskbarPillWindow : IDisposable
     private void LoadOffsetFromSettings()
     {
         var s = App.Services.Settings;
-        _offsetPx = s.TaskbarBatteryOffsetX;
-        _offsetDpi = s.TaskbarBatteryOffsetDpi;
+        _position = TaskbarBatteryPosition.Normalize(s.TaskbarBatteryPosition);
+        (_offsetPx, _offsetDpi) = TaskbarBatteryPosition.GetOffset(s, _position);
     }
 
     private void OnDeviceUpdated(DeviceStatus _) => RequestRefresh();
@@ -106,6 +107,8 @@ public sealed class TaskbarPillWindow : IDisposable
     /// <summary>设置保存后的即时生效入口（开关/显示内容/最多台数可能都变了）。</summary>
     public void RefreshFromSettings()
     {
+        if (_dragging) OnLButtonUp();
+        HideTip();
         LoadOffsetFromSettings();
         _needRender = true;
         Update();
@@ -398,7 +401,7 @@ public sealed class TaskbarPillWindow : IDisposable
 
         int gap = (int)Math.Round(EdgeGapDip * Scale);
         int placeOffset = OffsetForCurrentDpi(out _);
-        var (x, y) = TaskbarLayout.Place(_taskbarRect, _trayRect, _pillW, _pillH, placeOffset, gap, out int applied);
+        var (x, y) = TaskbarLayout.Place(_taskbarRect, _trayRect, _pillW, _pillH, placeOffset, gap, out int applied, _position);
         // 过渡帧（拔插显示器时任务栏/托盘矩形短暂错位）也会夹紧；只有拖动中才把夹紧结果写回记忆，
         // 否则分辨率往返后用户偏移会被污染。反推写回语义见 docs/dev/runtime-pitfalls.md §16.5。
         if (_dragging) _offsetPx = applied;
@@ -560,7 +563,7 @@ public sealed class TaskbarPillWindow : IDisposable
         // 用当帧可见（已夹紧）的偏移做起点：屏幕变窄贴片贴边时，一拖不会跳回越界前的记忆值
         int gap = (int)Math.Round(EdgeGapDip * Scale);
         int placeOffset = OffsetForCurrentDpi(out uint dpi);
-        TaskbarLayout.Place(_taskbarRect, _trayRect, _pillW, _pillH, placeOffset, gap, out int visible);
+        TaskbarLayout.Place(_taskbarRect, _trayRect, _pillW, _pillH, placeOffset, gap, out int visible, _position);
         _offsetPx = visible;
         _offsetDpi = (int)dpi;
 
@@ -802,8 +805,7 @@ public sealed class TaskbarPillWindow : IDisposable
         Native.ReleaseCapture();
 
         var s = App.Services.Settings;
-        s.TaskbarBatteryOffsetX = _offsetPx;
-        s.TaskbarBatteryOffsetDpi = _offsetDpi;
+        TaskbarBatteryPosition.SetOffset(s, _position, _offsetPx, _offsetDpi);
         s.Save();
     }
 

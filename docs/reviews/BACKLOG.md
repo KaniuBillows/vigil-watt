@@ -28,8 +28,14 @@
 | **CR-69** | 社区 PR #16（设备管理）未纳入：删离线条目会连带删历史（虽先 `VACUUM INTO` 备份），"只显示在线""电量条对齐"边界未定。冲突面在文档 + `BatteryPluginBase` + `AppSettings` | PR #16 提交 `6908997f` | `open` |
 | **CR-70** | 社区 PR #15 的 BLE 大改未纳入（`BleBatteryWatcher` +38/-22、`WatcherProps`、`DeviceKindGuesser`、`DeviceSourceInfo`、`SettingsPage`）。通用 GATT 路径已能读标准电池服务，故本轮只摘设备插件；蓝牙通道要单独一轮 | PR #15 | `open` |
 | **CR-71** | 社区 issue #12（任务栏贴片避让托盘图标）只有根因与修法描述，没有代码。`TaskbarLayout.Place` 现在固定贴托盘左侧，与 CR-39 同源 | issue #12、`Services/TaskbarLayout.cs:Place` | `open` |
-| **CR-72** | 社区 issue #11 现象 2（断电后死锁）未处理：涉及基类读实现，风险高于收益，需单独排期并配复现手段 | issue #11 | `open` |
+| **CR-72** | P1：单设备慢调用/挂起可占住全局 pass，阻塞后续轮询与发现；需分设备隔离、可取消 I/O 和超时后的旧任务隔离，社区断电冻结现象的确切触发点仍待复现 | `DeviceManager:RunExclusiveAsync/PollOnceAsync`、`HidDeviceHandle:GetFeature/WriteOutput`、issue #11 | `open` |
 | **CR-74** | Haute 运行日志已记录 Win32 1167 后恢复，芯片身份修复已部署且用户确认可提交；长期休眠场景继续观察，最初三次失败缺历史错误码 | `HautePlugin.cs:ReadStatus/RecoverStatus`，`hardware/protocols.md` §15 | `open` |
+| **CR-78** | P1：缺少系统睡眠恢复、会话解锁后的统一健康检查与有界恢复调度，仍依赖普通 15/60 秒定时器 | `DeviceManager:Start/StartTimers`、`App.xaml.cs`；见 `archive/stability-recovery-2026-10-20.md` | `open` |
+| **CR-79** | P1：HID 读错误与普通超时均返回 null，路径仍在时基类继续复用旧句柄；尚无通用失效句柄重开与重探流程 | `HidDeviceHandle:ReadInputAsync`、`BatteryPluginBase:AttachAsync/Poll` | `open` |
+| **CR-80** | P1：两个蓝牙 watcher 在真正启动前置 _started，创建失败后无法重试，也不处理 Stopped/Aborted 恢复 | `BleBatteryWatcher:Start`、`BluetoothClassicWatcher:Start` | `open` |
+| **CR-81** | P1：BLE GATT 与经典蓝牙连接确认结果无连接代次校验，断连/移除后旧异步结果可能重新上报在线 | `BleBatteryWatcher:ReadBatteryViaGattAsync/HandleRemoved`、`BluetoothClassicWatcher:VerifyConnectionAndAddAsync` | `open` |
+| **CR-82** | P2：在线标志、状态更新时间与电量读数新鲜度未分开，无法可靠区分有效缓存、重连待确认与监控停滞 | `DeviceStatus:LastUpdated/IsOnline`、`BatteryPluginBase:TryApplyReading/MarkOffline`、`DeviceManager:SafeSample` | `open` |
+| **CR-83** | P2：除 Haute 等特例外仍按接口路径生成设备 ID，路径变化会拆分设备条目、历史和自定义名称；需可验证的物理身份与保守回退 | `BatteryPluginBase:BuildDeviceId`、`MchosePlugin:BuildDeviceId` | `open` |
 
 ## 重构候选（未做）
 

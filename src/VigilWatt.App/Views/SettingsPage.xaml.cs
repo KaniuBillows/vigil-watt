@@ -92,6 +92,9 @@ public sealed partial class SettingsPage : Page
         var taskbarMode = TaskbarBatteryMode.Normalize(s.TaskbarBatteryMode);
         SelectByTag(TaskbarModeCombo, taskbarMode);
         TaskbarModeHintText.Text = TaskbarBatteryMode.Describe(taskbarMode);
+        var taskbarPosition = TaskbarBatteryPosition.Normalize(s.TaskbarBatteryPosition);
+        SelectByTag(TaskbarPositionCombo, taskbarPosition);
+        TaskbarPositionHintText.Text = TaskbarBatteryPosition.Describe(taskbarPosition);
         SelectByTag(TaskbarMaxCombo, TaskbarBatteryOptions.Clamp(s.TaskbarBatteryMaxDevices));
 
         // 窗口背景：下拉框选中"用户偏好"，副标题说"这台机器上实际会生效什么"——
@@ -145,6 +148,12 @@ public sealed partial class SettingsPage : Page
     {
         if (TaskbarModeCombo.SelectedItem is not ComboBoxItem item || item.Tag is not string tag) return;
         TaskbarModeHintText.Text = TaskbarBatteryMode.Describe(tag);
+    }
+
+    private void TaskbarPosition_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (TaskbarPositionCombo.SelectedItem is not ComboBoxItem item || item.Tag is not string tag) return;
+        TaskbarPositionHintText.Text = TaskbarBatteryPosition.Describe(tag);
     }
 
     /// <summary>副标题按"选中的偏好在本机上实际会生效成什么"来写。</summary>
@@ -419,6 +428,8 @@ public sealed partial class SettingsPage : Page
             ? WidgetMaxDevicesOptions.Clamp(maxValue)
             : WidgetMaxDevicesOptions.Default;
         s.TaskbarBatteryEnabled = TaskbarToggle.IsOn;
+        s.TaskbarBatteryPosition = TaskbarBatteryPosition.Normalize(
+            (TaskbarPositionCombo.SelectedItem as ComboBoxItem)?.Tag as string);
         s.TaskbarBatteryMode = TaskbarBatteryMode.Normalize(
             (TaskbarModeCombo.SelectedItem as ComboBoxItem)?.Tag as string);
         s.TaskbarBatteryMaxDevices = TaskbarMaxCombo.SelectedItem is ComboBoxItem taskbarMaxItem

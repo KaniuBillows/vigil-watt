@@ -466,10 +466,12 @@ light-dismiss，**用它右键菜单就关不掉**。所以贴片的右键菜单
 
 贴片位置不是自由坐标，而是"**默认位 + offset**"：
 
+- `TaskbarBatteryPosition` 选择锚点：`Left` 是任务栏左端，`Right` 是通知区域左侧；竖向任务栏分别对应顶端、托盘上方。旧配置缺字段或值不合法时沿用 `Right`，不迁移已有偏移。
 - 横向任务栏只取鼠标位移的 **X**、竖向只取 **Y**（斜着拖不会把贴片拽离任务栏）；
 - **只有拖动中**才把"实际落点 - 默认位"反推回 `_offsetPx`（拖到头再往回拖不会"空走"）。
   平时过渡帧（拔插显示器时任务栏/托盘矩形短暂错位）也会夹紧，若写回记忆，分辨率往返后偏移就被污染；
-- 松手时写入 `TaskbarBatteryOffsetX` + `TaskbarBatteryOffsetDpi`（记下偏移时的任务栏 DPI），重启沿用；
+- 左右分别记忆拖动偏移与 DPI：右侧沿用 `TaskbarBatteryOffsetX` / `TaskbarBatteryOffsetDpi`，左侧使用 `TaskbarBatteryLeftOffsetX` / `TaskbarBatteryLeftOffsetDpi`；切换位置不覆盖另一侧记忆，首次靠左从左端留白位置开始。
+- 设置页“任务栏 → 贴片位置”独立提供“靠左 / 靠右”，保存后即时生效；改变位置时结束当前拖动并隐藏旧悬停提示，再装载对应偏移。
 - 落位时用 `TaskbarLayout.ScaleOffset` 从**同一对规范值**换算到当前 DPI（不能逐帧累乘）。
 
 拖动用原生 `SetCapture` / `ReleaseCapture` + `WM_MOUSEMOVE`：按下用**当帧可见（已夹紧）偏移**做起点、
